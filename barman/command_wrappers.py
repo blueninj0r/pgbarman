@@ -330,7 +330,7 @@ class Rsync(Command):
                 raise
         return self.out, self.err
 
-    def smart_copy(self, src, dst, safe_horizon=None, ref=None):
+    def smart_copy(self, src, dst, safe_horizon=None, ref=None, disable_checksum=False):
         """
         Recursively copies files from "src" to "dst" in a way that is safe from
         the point of view of a PostgreSQL backup.
@@ -486,11 +486,10 @@ class Rsync(Command):
 
             # Copy remaining files with checksums
             _logger.info("Smart copy step 4/4: copy with checksums")
-            self._rsync_ignore_vanished_files(
-                '--checksum',
-                '--files-from=%s' % check_list.name,
-                src, dst,
-                check=True)
+            rsync_args = ['--checksum', '--files-from=%s' % check_list.name, src, dst]
+            if disable_checksum:
+                rsync_args.remove('--checksum')
+            self._rsync_ignore_vanished_files(*rsync_args, check=True)
 
             # TODO: remove debug output when the procedure is marked as 'stable'
             # Restore the original arguments for rsync

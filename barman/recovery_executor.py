@@ -538,7 +538,7 @@ class RecoveryExecutor(object):
 
     def recover(self, backup_info, dest, tablespaces, target_tli,
                 target_time, target_xid, target_name,
-                exclusive, remote_command):
+                exclusive, remote_command, disable_checksum):
         """
         Performs a recovery of a backup
 
@@ -597,7 +597,9 @@ class RecoveryExecutor(object):
                 self.basebackup_copy,
                 backup_info, dest,
                 tablespaces, remote_command,
-                recovery_info['safe_horizon'])
+                recovery_info['safe_horizon'],
+                disable_checksum
+            )
         except DataTransferFailure, e:
             output.exception("Failure copying base backup: %s", e)
             output.close_and_exit()
@@ -667,7 +669,7 @@ class RecoveryExecutor(object):
         return recovery_info
 
     def basebackup_copy(self, backup_info, dest, tablespaces=None,
-                        remote_command=None, safe_horizon=None):
+                        remote_command=None, safe_horizon=None, disable_checksum=False):
         """
         Perform the actual copy of the base backup for recovery purposes
 
@@ -739,7 +741,9 @@ class RecoveryExecutor(object):
             rsync.smart_copy(
                 '%s/' % backup_info.get_data_directory(),
                 dest_prefix + dest,
-                safe_horizon)
+                safe_horizon,
+                disable_checksum=disable_checksum
+            )
         except CommandFailedException, e:
             msg = "data transfer failure on directory '%s'" % dest
             raise DataTransferFailure.from_rsync_error(e, msg)

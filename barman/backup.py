@@ -380,7 +380,7 @@ class BackupManager(object):
 
     def recover(self, backup_info, dest, tablespaces=None, target_tli=None,
                 target_time=None, target_xid=None, target_name=None,
-                exclusive=False, remote_command=None):
+                exclusive=False, remote_command=None, disable_checksum=None):
         """
         Performs a recovery of a backup
 
@@ -406,7 +406,8 @@ class BackupManager(object):
                                          dest, tablespaces,
                                          target_tli, target_time,
                                          target_xid, target_name,
-                                         exclusive, remote_command)
+                                         exclusive, remote_command,
+                                         disable_checksum)
 
         # Output recovery results
         output.result('recovery', recovery_info['results'])

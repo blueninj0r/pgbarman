@@ -932,7 +932,7 @@ class Server(object):
 
     def recover(self, backup_info, dest, tablespaces=None, target_tli=None,
                 target_time=None, target_xid=None, target_name=None,
-                exclusive=False, remote_command=None):
+                exclusive=False, remote_command=None, disable_checksum=None):
         """
         Performs a recovery of a backup
 
@@ -951,7 +951,7 @@ class Server(object):
         """
         return self.backup_manager.recover(
             backup_info, dest, tablespaces, target_tli, target_time, target_xid,
-            target_name, exclusive, remote_command)
+            target_name, exclusive, remote_command, disable_checksum)
 
     def cron(self, verbose=True, wals=True, retention_policies=True):
         """

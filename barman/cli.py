@@ -294,6 +294,8 @@ def rebuild_xlogdb(args):
      type=check_positive)
 @arg('--no-retry', help='Disable base backup copy retry logic.',
      dest='retry_times', action='store_const', const=0)
+@arg('--no-rsync-checksum', help='Disable rsync checksum in smart copy.',
+     dest='disable_checksum', action='store_true')
 @expects_obj
 def recover(args):
     """
