@@ -356,7 +356,8 @@ def recover(args):
                    target_xid=args.target_xid,
                    target_name=args.target_name,
                    exclusive=args.exclusive,
-                   remote_command=args.remote_ssh_command)
+                   remote_command=args.remote_ssh_command,
+                   disable_checksum=args.disable_checksum)
 
     output.close_and_exit()
 
