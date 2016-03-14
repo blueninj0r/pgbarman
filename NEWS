@@ -1,5 +1,141 @@
 Barman News - History of user-visible changes
-Copyright (C) 2011-2015 2ndQuadrant Italia (Devise.IT S.r.l.)
+Copyright (C) 2011-2016 2ndQuadrant Italia Srl
+
+Version 1.6.0 - 29 Feb 2016
+
+-   Support for streaming replication connection through the
+    streaming_conninfo server option
+
+-   Support for the streaming_archiver option that allows Barman to
+    receive WAL files through PostgreSQL's native streaming protocol.
+    When set to 'on', it relies on pg_receivexlog to receive WAL data,
+    reducing Recovery Point Objective. Currently, WAL streaming is an
+    additional feature (standard log archiving is still required)
+
+-   Implement the receive-wal command that, when streaming_archiver is
+    on, wraps pg_receivexlog for WAL streaming. Add --stop option to
+    stop receiving WAL files via streaming protocol. Add --reset option
+    to reset the streaming status and restart from the current xlog
+    in Postgres.
+
+-   Automatic management (startup and stop) of receive-wal command via
+    cron command
+
+-   Support for the path_prefix configuration option
+
+-   Introduction of the archiver option (currently fixed to on) which
+    enables continuous WAL archiving for a specific server, through log
+    shipping via PostgreSQL's archive_command
+
+-   Support for streaming_wals_directory and errors_directory options
+
+-   Management of WAL duplicates in archive-wal command and integration
+    with check command
+
+-   Verify if pg_receivexlog is running in check command when
+    streaming_archiver is enabled
+
+-   Verify if failed backups are present in check command
+
+-   Accept compressed WAL files in incoming directory
+
+-   Add support for the pigz compressor (thanks to Stefano Zacchiroli
+    zack@upsilon.cc)
+
+-   Implement pygzip and pybzip2 compressors (based on an initial idea
+    of Christoph Moench-Tegeder christoph@2ndquadrant.de)
+
+-   Creation of an implicit restore point at the end of a backup
+
+-   Current size of the PostgreSQL data files in barman status
+
+-   Permit archive_mode=always for PostgreSQL 9.5 servers (thanks to
+    Christoph Moench-Tegeder christoph@2ndquadrant.de)
+
+-   Complete refactoring of the code responsible for connecting to
+    PostgreSQL
+
+-   Improve messaging of cron command regarding sub-processes
+
+-   Native support for Python >= 3.3
+
+-   Changes of behaviour:
+    -   Stop trashing WAL files during archive-wal (commit:e3a1d16)
+
+-   Bug fixes:
+    -   Atomic WAL file archiving (#9 and #12)
+    -   Propagate "-c" option to any Barman subprocess (#19)
+    -   Fix management of backup ID during backup deletion (#22)
+    -   Improve archive-wal robustness and log messages (#24)
+    -   Improve error handling in case of missing parameters
+
+Version 1.5.1 - 16 Nov 2015
+
+-   Add support for the 'archive-wal' command which performs WAL
+    maintenance operations on a given server
+-   Add support for "per-server" concurrency of the 'cron' command
+-   Improved management of xlog.db errors
+-   Add support for mixed compression types in WAL files (SF.net#61)
+-   Bug fixes:
+    -   Avoid retention policy checks during the recovery
+    -   Avoid 'wal_level' check on PostgreSQL version < 9.0 (#3)
+    -   Fix backup size calculation (#5)
+
+Version 1.5.0 - 28 Sep 2015
+
+-   Add support for the get-wal command which allows users to fetch any
+    WAL file from the archive of a specific server
+-   Add support for retry hook scripts, a special kind of hook scripts
+    that Barman tries to run until they succeed
+-   Add active configuration option for a server to temporarily disable
+    the server by setting it to False
+-   Add barman_lock_directory global option to change the location of
+    lock files (by default: 'barman_home')
+-   Execute the full suite of checks before starting a backup, and skip
+    it in case one or more checks fail
+-   Forbid to delete a running backup
+-   Analyse include directives of a PostgreSQL server during backup and
+    recover operations
+-   Add check for conflicting paths in the configuration of Barman, both
+    intra (by temporarily disabling a server) and inter-server (by
+    refusing any command, to any server).
+-   Add check for wal_level
+-   Add barman-wal-restore script to be used as restore_command on a
+    standby server, in conjunction with barman get-wal
+-   Implement a standard and consistent policy for error management
+-   Improved cache management of backups
+-   Improved management of configuration in unit tests
+-   Tutorial and man page sources have been converted to Markdown format
+-   Add code documentation through Sphinx
+-   Complete refactor of the code responsible for managing the backup
+    and the recover commands
+-   Changed internal directory structure of a backup
+-   Introduce copy_method option (currently fixed to rsync)
+-   Bug fixes:
+    -   Manage options without '=' in PostgreSQL configuration files
+    -   Preserve Timeline history files (Fixes: #70)
+    -   Workaround for rsync on SUSE Linux (Closes: #13 and #26)
+    -   Disables dangerous settings in postgresql.auto.conf
+        (Closes: #68)
+
+Version 1.4.1 - 05 May 2015
+
+* Fix for WAL archival stop working if first backup is EMPTY
+  (Closes: #64)
+* Fix exception during error handling in Barman recovery
+  (Closes: #65)
+* After a backup, limit cron activity to WAL archiving only
+  (Closes: #62)
+* Improved robustness and error reporting of the backup delete
+  command (Closes: #63)
+* Fix computation of WAL production ratio as reported in the
+  show-backup command
+* Improved management of xlogb file, which is now correctly fsynced
+  when updated. Also, the rebuild-xlogdb command now operates on a
+  temporary new file, which overwrites the main one when finished.
+* Add unit tests for dateutil module compatibility
+* Modified Barman version following PEP 440 rules and added support
+  of tests in Python 3.4
 
 Version 1.4.0 - 26 Jan 2015
 

@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2011-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -18,23 +18,42 @@
 """
 This module implements the interface with the command line and the logger.
 """
+
 import logging
 import os
 import sys
-
-from argh import ArghParser, named, arg, expects_obj
 from argparse import SUPPRESS, ArgumentTypeError
 
+from argh import ArghParser, arg, expects_obj, named
+
+import barman.config
+import barman.diagnose
 from barman import output
 from barman.infofile import BackupInfo
-from barman import lockfile
 from barman.server import Server
-import barman.diagnose
-import barman.config
-from barman.utils import drop_privileges, configure_logging, parse_log_level
-
+from barman.utils import configure_logging, drop_privileges, parse_log_level
+from barman.xlog import BadXlogSegmentName
 
 _logger = logging.getLogger(__name__)
+
+
+def check_non_negative(value):
+    """
+    Check for a positive integer option
+
+    :param value: str containing the value to check
+    """
+    if value is None:
+        return None
+    try:
+        int_value = int(value)
+    except Exception:
+        raise ArgumentTypeError("'%s' is not a valid non negative integer" %
+                                value)
+    if int_value < 0:
+        raise ArgumentTypeError("'%s' is not a valid non negative integer" %
+                                value)
+    return int_value
 
 
 def check_positive(value):
@@ -48,9 +67,11 @@ def check_positive(value):
     try:
         int_value = int(value)
     except Exception:
-        raise ArgumentTypeError("'%s' is not a valid positive integer" % value)
-    if int_value < 0:
-        raise ArgumentTypeError("'%s' is not a valid positive integer" % value)
+        raise ArgumentTypeError("'%s' is not a valid positive integer" %
+                                value)
+    if int_value < 1:
+        raise ArgumentTypeError("'%s' is not a valid positive integer" %
+                                value)
     return int_value
 
 
@@ -86,25 +107,18 @@ def cron():
     """
     Run maintenance tasks (global command)
     """
-    try:
-        with lockfile.GlobalCronLock(barman.__config__.barman_lock_directory):
-            # Skip inactive and temporarily disabled servers
-            servers = get_server_list(skip_inactive=True, skip_disabled=True)
-            for name in sorted(servers):
-                server = servers[name]
+    # Skip inactive and temporarily disabled servers
+    servers = get_server_list(skip_inactive=True, skip_disabled=True)
+    for name in sorted(servers):
+        server = servers[name]
 
-                # Exception: manage_server_command is not invoked here
-                # Normally you would call manage_server_command to check if the
-                # server is None and to report inactive and disabled servers,
-                # but here we have only active and well configured servers.
+        # Exception: manage_server_command is not invoked here
+        # Normally you would call manage_server_command to check if the
+        # server is None and to report inactive and disabled servers,
+        # but here we have only active and well configured servers.
 
-                server.cron()
+        server.cron()
 
-    except lockfile.LockFileBusy:
-        output.info("Another cron is running")
-
-    except lockfile.LockFilePermissionDenied, e:
-        output.error("Permission denied, unable to access '%s'", e)
     output.close_and_exit()
 
 
@@ -132,7 +146,6 @@ def backup_completer(prefix, parsed_args, **kwargs):
     global_config(parsed_args)
     server = get_server(parsed_args)
 
-    backup_name = getattr(parsed_args, 'backup_id', None) or ''
     backups = server.get_available_backups()
     for backup_id in sorted(backups, reverse=True):
         if backup_id.startswith(prefix):
@@ -163,10 +176,10 @@ def backup_completer(prefix, parsed_args, **kwargs):
           'If no argument is given "link" is assumed')
 @arg('--retry-times',
      help='Number of retries after an error if base backup copy fails.',
-     type=check_positive)
+     type=check_non_negative)
 @arg('--retry-sleep',
      help='Wait time after a failed base backup copy, before retrying.',
-     type=check_positive)
+     type=check_non_negative)
 @arg('--no-retry', help='Disable base backup copy retry logic.',
      dest='retry_times', action='store_const', const=0)
 @expects_obj
@@ -262,7 +275,7 @@ def rebuild_xlogdb(args):
 @arg('server_name',
      completer=server_completer,
      help='specifies the server name for the command')
-@arg('--target-tli', help='target timeline', type=int)
+@arg('--target-tli', help='target timeline', type=check_positive)
 @arg('--target-time',
      help='target time. You can use any valid unambiguous representation. '
           'e.g: "YYYY-MM-DD HH:MM:SS.mmm"')
@@ -278,9 +291,10 @@ def rebuild_xlogdb(args):
 @arg('--remote-ssh-command',
      metavar='SSH_COMMAND',
      help='This options activates remote recovery, by specifying the secure '
-          'shell command to be launched on a remote host. It is the equivalent '
-          'of the "ssh_command" server option in the configuration file for '
-          'remote recovery. Example: "ssh postgres@db2"')
+          'shell command to be launched on a remote host. It is '
+          'the equivalent of the "ssh_command" server option in '
+          'the configuration file for remote recovery. '
+          'Example: "ssh postgres@db2"')
 @arg('backup_id',
      completer=backup_completer,
      help='specifies the backup ID to recover')
@@ -288,10 +302,10 @@ def rebuild_xlogdb(args):
      help='the directory where the new server is created')
 @arg('--retry-times',
      help='Number of retries after an error if base backup copy fails.',
-     type=check_positive)
+     type=check_non_negative)
 @arg('--retry-sleep',
      help='Wait time after a failed base backup copy, before retrying.',
-     type=check_positive)
+     type=check_non_negative)
 @arg('--no-retry', help='Disable base backup copy retry logic.',
      dest='retry_times', action='store_const', const=0)
 @arg('--no-rsync-checksum', help='Disable rsync checksum in smart copy.',
@@ -326,8 +340,10 @@ def recover(args):
                 output.close_and_exit()
 
     # validate the rules against the tablespace list
-    valid_tablespaces = [tablespace_data.name for tablespace_data in
-                         backup_id.tablespaces] if backup_id.tablespaces else []
+    valid_tablespaces = []
+    if backup_id.tablespaces:
+        valid_tablespaces = [tablespace_data.name for tablespace_data in
+                             backup_id.tablespaces]
     for item in tablespaces:
         if item not in valid_tablespaces:
             output.error("Invalid tablespace name '%s'\n"
@@ -477,9 +493,16 @@ def list_files(args):
 
     # Retrieves the backup
     backup_id = parse_backup_id(server, args)
-    for line in backup_id.get_list_of_files(args.target):
-        output.info(line, log=False)
-    output.close_and_exit()
+    try:
+        for line in backup_id.get_list_of_files(args.target):
+            output.info(line, log=False)
+    except BadXlogSegmentName as e:
+        output.error(
+            "invalid xlog segment name %r\n"
+            "HINT: Please run \"barman rebuild-xlogdb %s\" "
+            "to solve this issue",
+            str(e), server.config.name)
+        output.close_and_exit()
 
 
 @arg('server_name',
@@ -499,6 +522,117 @@ def delete(args):
     backup_id = parse_backup_id(server, args)
     server.delete_backup(backup_id)
     output.close_and_exit()
+
+
+@named('get-wal')
+@arg('server_name',
+     completer=server_completer,
+     help='specifies the server name for the command')
+@arg('wal_name',
+     help='the WAL file to get')
+@arg('--output-directory', '-o',
+     help='put the retrieved WAL file in this directory '
+          'with the original name',
+     default=SUPPRESS)
+@arg('--gzip', '-z', '-x',
+     help='compress the output with gzip',
+     action='store_const', const='gzip', dest='compression', default=SUPPRESS)
+@arg('--bzip2', '-j',
+     help='compress the output with bzip2',
+     action='store_const', const='bzip2', dest='compression', default=SUPPRESS)
+@arg('--peek', '-p',
+     help="peek from the WAL archive up to 'SIZE' WAL files, starting "
+          "from the requested one. 'SIZE' must be an integer >= 1. "
+          "When invoked with this option, get-wal returns a list of "
+          "zero to 'SIZE' WAL segment names, one per row.",
+     metavar='SIZE',
+     type=check_positive,
+     default=SUPPRESS)
+@expects_obj
+def get_wal(args):
+    """
+    Retrieve WAL_NAME file from SERVER_NAME archive.
+    The content will be streamed on standard output unless
+    the --output-directory option is specified.
+    """
+    server = get_server(args)
+
+    # Retrieve optional arguments. If an argument is not specified,
+    # the namespace doesn't contain it due to SUPPRESS default.
+    # In that case we pick 'None' using getattr third argument.
+    compression = getattr(args, 'compression', None)
+    output_directory = getattr(args, 'output_directory', None)
+    peek = getattr(args, 'peek', None)
+
+    server.get_wal(args.wal_name,
+                   compression=compression,
+                   output_directory=output_directory,
+                   peek=peek)
+    output.close_and_exit()
+
+
+@named('archive-wal')
+@arg('server_name',
+     completer=server_completer,
+     help='specifies the server name for the command')
+@expects_obj
+def archive_wal(args):
+    """
+    Execute maintenance operations on WAL files for a given server.
+    This command processes any incoming WAL files for the server
+    and archives them along the catalogue.
+
+    """
+    server = get_server(args)
+    server.archive_wal()
+    output.close_and_exit()
+
+
+@named('receive-wal')
+@arg('--stop', help='stop the receive-wal subprocess for the server',
+     action='store_true')
+@arg('--reset', help='reset the status of receive-wal removing '
+                     'any status files',
+     action='store_true')
+@arg('server_name',
+     completer=server_completer,
+     help='specifies the server name for the command')
+@expects_obj
+def receive_wal(args):
+    """
+    Start a receive-wal process.
+    The process uses the streaming protocol to receive WAL files
+    from the PostgreSQL server.
+    """
+    server = get_server(args)
+    if args.stop and args.reset:
+        output.error("--stop and --reset options are not compatible")
+    # If the caller requested to shutdown the receive-wal process deliver the
+    # termination signal, otherwise attempt to start it
+    elif args.stop:
+        server.kill('receive-wal')
+    else:
+        server.receive_wal(reset=args.reset)
+    output.close_and_exit()
+
+
+def pretty_args(args):
+    """
+    Prettify the given argh namespace to be human readable
+
+    :type args: argh.dispatching.ArghNamespace
+    :return: the human readable content of the namespace
+    """
+    values = dict(vars(args))
+    # Retrieve the command name with recent argh versions
+    if '_functions_stack' in values:
+        values['command'] = values['_functions_stack'][0].__name__
+        del values['_functions_stack']
+    # Older argh versions only have the matching function in the namespace
+    elif 'function' in values:
+        values['command'] = values['function'].__name__
+        del values['function']
+    return "%r" % values
 
 
 def global_config(args):
@@ -540,14 +674,13 @@ def global_config(args):
                                  debug=args.debug)
 
     # Load additional configuration files
-    _logger.debug('Loading additional configuration files')
     config.load_configuration_files_directory()
     # We must validate the configuration here in order to have
     # both output and logging configured
     config.validate_global_config()
 
-    _logger.debug('Initialised Barman version %s (config: %s)',
-                  barman.__version__, config.config_file)
+    _logger.debug('Initialised Barman version %s (config: %s, args: %s)',
+                  barman.__version__, config.config_file, pretty_args(args))
 
 
 def get_server(args, skip_inactive=True, skip_disabled=False,
@@ -558,7 +691,11 @@ def get_server(args, skip_inactive=True, skip_disabled=False,
     Returns a Server object or None if the required server is unknown and
     on_error_stop is False.
 
-    :param args: an argparse namespace containing a single server_name parameter
+    WARNING: this function modifies the 'args' parameter
+
+    :param args: an argparse namespace containing a single
+        server_name parameter
+        WARNING: the function modifies the content of this parameter
     :param bool skip_inactive: skip inactive servers when 'all' is required
     :param bool skip_disabled: skip disabled servers when 'all' is required
     :param bool on_error_stop: stop if an error is found
@@ -581,9 +718,8 @@ def get_server(args, skip_inactive=True, skip_disabled=False,
     args.server_name = [name]
 
     # Retrieve the requested server
-    servers = get_server_list(args, skip_inactive,
-                              skip_disabled, on_error_stop,
-                              suppress_error)
+    servers = get_server_list(args, skip_inactive, skip_disabled,
+                              on_error_stop, suppress_error)
 
     # The requested server has been excluded from get_server_list result
     if len(servers) == 0:
@@ -666,17 +802,18 @@ def get_server_list(args=None, skip_inactive=False, skip_disabled=False,
             # Unknown server
             server_dict[server] = None
         else:
+            server_object = Server(conf)
             # Skip inactive servers, if requested
-            if skip_inactive and not conf.active:
+            if skip_inactive and not server_object.config.active:
                 output.info("Skipping inactive server '%s'"
                             % conf.name)
                 continue
             # Skip disabled servers, if requested
-            if skip_disabled and conf.disabled:
+            if skip_disabled and server_object.config.disabled:
                 output.info("Skipping temporarily disabled server '%s'"
                             % conf.name)
                 continue
-            server_dict[server] = Server(conf)
+            server_dict[server] = server_object
 
     return server_dict
 
@@ -741,9 +878,9 @@ def parse_backup_id(server, args):
     :rtype: BackupInfo
     """
     if args.backup_id in ('latest', 'last'):
-        backup_id = server.get_last_backup()
+        backup_id = server.get_last_backup_id()
     elif args.backup_id in ('oldest', 'first'):
-        backup_id = server.get_first_backup()
+        backup_id = server.get_first_backup_id()
     else:
         backup_id = args.backup_id
     backup_info = server.get_backup(backup_id)
@@ -774,19 +911,22 @@ def main():
                    default=output.DEFAULT_WRITER)
     p.add_commands(
         [
-            cron,
-            list_server,
-            show_server,
-            status,
-            check,
-            diagnose,
+            archive_wal,
             backup,
-            list_backup,
-            show_backup,
-            list_files,
-            recover,
+            check,
+            cron,
             delete,
+            diagnose,
+            get_wal,
+            list_backup,
+            list_files,
+            list_server,
             rebuild_xlogdb,
+            receive_wal,
+            recover,
+            show_backup,
+            show_server,
+            status
         ]
     )
     # noinspection PyBroadException
@@ -795,7 +935,7 @@ def main():
     except KeyboardInterrupt:
         msg = "Process interrupted by user (KeyboardInterrupt)"
         output.exception(msg)
-    except Exception, e:
+    except Exception as e:
         msg = "%s\nSee log file for more details." % e
         output.exception(msg)
 

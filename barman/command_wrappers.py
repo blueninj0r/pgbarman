@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2011-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -18,20 +18,26 @@
 """
 This module contains a wrapper for shell commands
 """
-import inspect
-import shutil
 
-import sys
+from __future__ import print_function
+
+import collections
+import errno
+import inspect
+import logging
+import os
+import re
+import select
+import shutil
 import signal
 import subprocess
-import os
-import logging
-import re
-import collections
+import sys
 import tempfile
-import barman.utils
+
 import dateutil.parser
 import dateutil.tz
+
+import barman.utils
 
 _logger = logging.getLogger(__name__)
 
@@ -72,14 +78,71 @@ class DataTransferFailure(Exception):
         details += e.args[0]['err']
         return cls(details)
 
+
+class StreamLineProcessor(object):
+    """
+    Class deputed to reading lines from a file object, using a buffered read.
+
+    NOTE: This class never call os.read() twice in a row. And is designed to
+    work with the select.select() method.
+    """
+
+    def __init__(self, fobject, handler):
+        """
+        :param file fobject: The file that is being read
+        :param callable handler: The function (taking only one unicode string
+         argument) which will be called for every line
+        """
+        self._file = fobject
+        self._handler = handler
+        self._buf = ''
+
+    def fileno(self):
+        """
+        Method used by select.select() to get the underlying file descriptor.
+
+        :rtype: the underlying file descriptor
+        """
+        return self._file.fileno()
+
+    def process(self):
+        """
+        Read the ready data from the stream and for each line found invoke the
+        handler.
+
+        :return bool: True when End Of File has been reached
+        """
+        data = os.read(self._file.fileno(), 4096)
+        # If nothing has been read, we reached the EOF
+        if not data:
+            self._file.close()
+            # Handle the last line (always incomplete, maybe empty)
+            self._handler(self._buf)
+            return True
+        self._buf += data.decode('utf-8')
+        # If no '\n' is present, we just read a part of a very long line.
+        # Nothing to do at the moment.
+        if '\n' not in self._buf:
+            return False
+        tmp = self._buf.split('\n')
+        # Leave the remainder in self._buf
+        self._buf = tmp[-1]
+        # Call the handler for each complete line.
+        lines = tmp[:-1]
+        for line in lines:
+            self._handler(line)
+        return False
+
+
 class Command(object):
     """
     Simple wrapper for a shell command
     """
 
-    def __init__(self, cmd, args=None, env_append=None, shell=False,
+    def __init__(self, cmd, args=None, env_append=None, path=None, shell=False,
                  check=False, allowed_retval=(0,), debug=False,
-                 close_fds=True):
+                 close_fds=True, out_handler=None, err_handler=None):
+        self.pipe = None
         self.cmd = cmd
         self.args = args if args is not None else []
         self.shell = shell
@@ -90,11 +153,31 @@ class Command(object):
         self.ret = None
         self.out = None
         self.err = None
+        # If env_append has been provided use it or replace with an empty dict
+        env_append = env_append or {}
+        # If path has been provided, replace it in the environment
+        if path:
+            env_append['PATH'] = path
+        # If env_append contains anything, build an env dict to be used during
+        # subprocess call, otherwise set it to None and let the subprocesses
+        # inherit the parent environment
         if env_append:
             self.env = os.environ.copy()
             self.env.update(env_append)
         else:
             self.env = None
+        # If an output handler has been provided use it, otherwise log the
+        # stdout as INFO
+        if out_handler:
+            self.out_handler = out_handler
+        else:
+            self.out_handler = self.make_logging_handler(logging.INFO)
+        # If an error handler has been provided use it, otherwise log the
+        # stderr as WARNING
+        if err_handler:
+            self.err_handler = err_handler
+        else:
+            self.err_handler = self.make_logging_handler(logging.WARNING)
 
     @staticmethod
     def _restore_sigpipe():
@@ -121,41 +204,217 @@ class Command(object):
         """
         Run the command and return the output and the error (if present)
         """
-        # check keyword arguments
+        out = []
+        err = []
+        # If check is true, it must be handled here
+        check = kwargs.pop('check', self.check)
+        self.execute(out_handler=out.append, err_handler=err.append,
+                     check=False, *args, **kwargs)
+        self.out = '\n'.join(out)
+        self.err = '\n'.join(err)
+        _logger.debug("Command stdout: %s", self.out)
+        _logger.debug("Command stderr: %s", self.err)
+
+        # Raise if check and the return code is not in the allowed list
+        if check:
+            self.check_return_value()
+        return self.out, self.err
+
+    def check_return_value(self):
+        """
+        Check the current return code and raise CommandFailedException when
+        it's not in the allowed_retval list
+
+        :raises: CommandFailedException
+        """
+        if self.ret not in self.allowed_retval:
+            raise CommandFailedException(dict(
+                ret=self.ret, out=self.out, err=self.err))
+
+    def execute(self, *args, **kwargs):
+        """
+        Execute the command and pass the output to the configured handlers
+        """
+        # Check keyword arguments
         stdin = kwargs.pop('stdin', None)
         check = kwargs.pop('check', self.check)
         close_fds = kwargs.pop('close_fds', self.close_fds)
+        out_handler = kwargs.pop('out_handler', self.out_handler)
+        err_handler = kwargs.pop('err_handler', self.err_handler)
         if len(kwargs):
             raise TypeError('%s() got an unexpected keyword argument %r' %
                             (inspect.stack()[1][3], kwargs.popitem()[0]))
+
+        # Reset status
+        self.ret = None
+        self.out = None
+        self.err = None
+
+        # Create the subprocess and save it in the current object to be usable
+        # by signal handlers
+        pipe = self._build_pipe(args, close_fds)
+        self.pipe = pipe
+
+        # Send the provided input and close the stdin descriptor
+        if stdin:
+            pipe.stdin.write(stdin)
+        pipe.stdin.close()
+        # Prepare the list of processors
+        processors = [
+            StreamLineProcessor(
+                pipe.stdout, out_handler),
+            StreamLineProcessor(
+                pipe.stderr, err_handler)]
+
+        # Read the streams until the subprocess exits
+        self.pipe_processor_loop(processors)
+
+        # Reap the zombie and read the exit code
+        pipe.wait()
+        self.ret = pipe.returncode
+
+        # Remove the closed pipe from the object
+        self.pipe = None
+        if self.debug:
+            print("Command return code: %s" % self.ret, file=sys.stderr)
+        _logger.debug("Command return code: %s", self.ret)
+
+        # Raise if check and the return code is not in the allowed list
+        if check:
+            self.check_return_value()
+        return self.ret
+
+    def _build_pipe(self, args, close_fds):
+        """
+        Build the Pipe object used by the Command
+
+        The resulting command will be composed by:
+           self.cmd + self.args + args
+
+        :param args: extra arguments for the subprocess
+        :param close_fds: if True all file descriptors except 0, 1 and 2
+            will be closed before the child process is executed.
+        :rtype: subprocess.Popen
+        """
+        # Append the argument provided to this method ot the base argument list
         args = self.args + list(args)
+        # If shell is True, properly quote the command
         if self.shell:
             cmd = self._cmd_quote(self.cmd, args)
         else:
             cmd = [self.cmd] + args
+        # Log the command we are about to execute
         if self.debug:
-            print >> sys.stderr, "Command: %r" % cmd
+            print("Command: %r" % cmd, file=sys.stderr)
         _logger.debug("Command: %r", cmd)
-        pipe = subprocess.Popen(cmd, shell=self.shell, env=self.env,
+        return subprocess.Popen(cmd, shell=self.shell, env=self.env,
                                 stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                                 preexec_fn=self._restore_sigpipe,
                                 close_fds=close_fds)
-        out, err = pipe.communicate(stdin)
-        # Convert output to a proper unicode string
-        self.out = out.decode('utf-8')
-        self.err = err.decode('utf-8')
-        self.ret = pipe.returncode
-        if self.debug:
-            print >> sys.stderr, "Command return code: %s" % self.ret
-        _logger.debug("Command return code: %s", self.ret)
-        _logger.debug("Command stdout: %s", self.out)
-        _logger.debug("Command stderr: %s", self.err)
-        if check and self.ret not in self.allowed_retval:
-            raise CommandFailedException(dict(
-                ret=self.ret, out=self.out, err=self.err))
-        return self.out, self.err
+
+    @staticmethod
+    def pipe_processor_loop(processors):
+        """
+        Process the output received through the pipe until all the provided
+        StreamLineProcessor reach the EOF.
+
+        :param list[StreamLineProcessor] processors: a list of
+            StreamLineProcessor
+        """
+        # Loop until all the streams reaches the EOF
+        while processors:
+            try:
+                ready = select.select(processors, [], [])[0]
+            except select.error as e:
+                # If the select call has been interrupted by a signal
+                # just retry
+                if e.args[0] == errno.EINTR:
+                    continue
+                raise
+
+            # For each ready StreamLineProcessor invoke the process() method
+            for stream in ready:
+                eof = stream.process()
+                # Got EOF on this stream
+                if eof:
+                    # Remove the stream from the list of valid processors
+                    processors.remove(stream)
+
+    @classmethod
+    def make_logging_handler(cls, level, prefix=None):
+        """
+        Build a handler function that logs every line it receives.
+
+        The resulting function logs its input at the specified level
+        with an optional prefix.
+
+        :param level: The log level to use
+        :param prefix: An optional prefix to prepend to the line
+        :return: handler function
+        """
+        class_logger = logging.getLogger(cls.__name__)
+
+        def handler(line):
+            if line:
+                if prefix:
+                    class_logger.log(level, "%s%s", prefix, line)
+                else:
+                    class_logger.log(level, "%s", line)
+        return handler
+
+    @staticmethod
+    def make_output_handler(prefix=None):
+        """
+        Build a handler function which prints every line it receives.
+
+        The resulting function prints (and log it at INFO level) its input
+        with an optional prefix.
+
+        :param prefix: An optional prefix to prepend to the line
+        :return: handler function
+        """
+
+        # Import the output module inside the function to avoid circular
+        # dependency
+        from barman import output
+
+        def handler(line):
+            if line:
+                if prefix:
+                    output.info("%s%s", prefix, line)
+                else:
+                    output.info("%s", line)
+
+        return handler
+
+    def enable_signal_forwarding(self, signal_id):
+        """
+        Enable signal forwarding to the subprocess for a specified signal_id
+
+        :param signal_id: The signal id to be forwarded
+        """
+        # Get the current signal handler
+        old_handler = signal.getsignal(signal_id)
+
+        def _handler(sig, frame):
+            """
+            This signal handler forward the signal to the subprocess then
+            execute the original handler.
+            """
+            # Forward the signal to the subprocess
+            if self.pipe:
+                self.pipe.send_signal(signal_id)
+            # If the old handler is callable
+            if callable(old_handler):
+                old_handler(sig, frame)
+            # If we have got a SIGTERM, we must exit
+            elif old_handler == signal.SIG_DFL and signal_id == signal.SIGTERM:
+                sys.exit(128 + signal_id)
+
+        # Set the signal handler
+        signal.signal(signal_id, _handler)
 
 
 class Rsync(Command):
@@ -213,7 +472,8 @@ class Rsync(Command):
         file\ has\ vanished:\ ".+"
         |
         # final summary
-        rsync\ error:\ .* \(code\ 23\)\ at\ main\.c\(\d+\)\ \[generator=[^\]]+\]
+        rsync\ error:\ .* \(code\ 23\)\ at\ main\.c\(\d+\)
+            \ \[generator=[^\]]+\]
         )
         $ # end of the line
     ''')
@@ -225,13 +485,13 @@ class Rsync(Command):
     def __init__(self, rsync='rsync', args=None, ssh=None, ssh_options=None,
                  bwlimit=None, exclude_and_protect=None,
                  network_compression=None, check=True, allowed_retval=(0, 24),
-                 **kwargs):
+                 path=None, **kwargs):
         options = []
         # Try to find rsync in system PATH using the which method.
         # If not found, rsync is not installed and this class cannot
         # work properly.
         # Raise CommandFailedException warning the user
-        rsync_path = barman.utils.which(rsync)
+        rsync_path = barman.utils.which(rsync, path)
         if not rsync_path:
             raise CommandFailedException('rsync not in system PATH: '
                                          'is rsync installed?')
@@ -240,14 +500,34 @@ class Rsync(Command):
         if network_compression:
             options += ['-z']
         if exclude_and_protect:
-            for path in exclude_and_protect:
-                options += ["--exclude=%s" % (path,), "--filter=P_%s" % (path,)]
+            for exclude_path in exclude_and_protect:
+                options += ["--exclude=%s" % (exclude_path,),
+                            "--filter=P_%s" % (exclude_path,)]
         if args:
-            options += args
+            options += self._args_for_suse(args)
         if bwlimit is not None and bwlimit > 0:
             options += ["--bwlimit=%s" % bwlimit]
         Command.__init__(self, rsync, args=options, check=check,
-                         allowed_retval=allowed_retval, **kwargs)
+                         allowed_retval=allowed_retval, path=path, **kwargs)
+
+    def _args_for_suse(self, args):
+        """
+        Mangle args for SUSE compatibility
+
+        See https://bugzilla.opensuse.org/show_bug.cgi?id=898513
+        """
+        # Prepend any argument starting with ':' with a space
+        # Workaround for SUSE rsync issue
+        return [' ' + a if a.startswith(':') else a for a in args]
+
+    def getoutput(self, *args, **kwargs):
+        """
+        Run the command and return the output and the error (if present)
+        """
+        # Prepares args for SUSE
+        args = self._args_for_suse(args)
+        # Invoke the base class method
+        return super(Rsync, self).getoutput(*args, **kwargs)
 
     def from_file_list(self, filelist, src, dst, *args, **kwargs):
         """
@@ -347,8 +627,8 @@ class Rsync(Command):
         everything with checksums enabled.
 
         If "ref" parameter is provided and is not None, it is looked up
-        instead of the "dst" dir. This is useful when we are copying files using
-        '--link-dest' and '--copy-dest' rsync options.
+        instead of the "dst" dir. This is useful when we are copying files
+        using '--link-dest' and '--copy-dest' rsync options.
         In this case, both the "dst" and "ref" dir must exist and
         the "dst" dir must be empty.
 
@@ -391,8 +671,8 @@ class Rsync(Command):
             ref_hash = None
             _logger.error(
                 "Unable to retrieve reference directory file list. "
-                "Using only source file information to decide which files need "
-                "to be copied with checksums enabled: %s" % e)
+                "Using only source file information to decide which files"
+                " need to be copied with checksums enabled: %s" % e)
 
         # We need a temporary directory to store the files containing the lists
         # we are building in order to instruct rsync about which files need to
@@ -409,8 +689,8 @@ class Rsync(Command):
             # The 'check.list' file will contain all files that need
             # to be copied with checksum option enabled
             check_list = open(os.path.join(temp_dir, 'check.list'), 'w+')
-            # The 'protect.list' file will contain a filter rule to protect each
-            # file present in the source tree. It will be used during
+            # The 'protect.list' file will contain a filter rule to protect
+            # each file present in the source tree. It will be used during
             # the first phase to delete all the extra files on destination.
             exclude_and_protect_filter = open(
                 os.path.join(temp_dir, 'exclude_and_protect.filter'), 'w+')
@@ -442,9 +722,9 @@ class Rsync(Command):
                 # destination, rsync will discover the difference in any case.
                 # It is then safe to skip checksum check here.
                 dst_item = ref_hash.get(item.path, None)
-                if (dst_item is None
-                        or dst_item.size != item.size
-                        or dst_item.date != item.date):
+                if (dst_item is None or
+                        dst_item.size != item.size or
+                        dst_item.date != item.date):
                     safe_list.write(item.path + '\n')
                     continue
 
@@ -457,7 +737,7 @@ class Rsync(Command):
             check_list.close()
             exclude_and_protect_filter.close()
 
-            # TODO: remove debug output when the procedure is marked as 'stable'
+            # TODO: remove debug output
             # By adding a double '--itemize-changes' option, the rsync output
             # will contain the full list of files that have been touched, even
             # those that have not changed
@@ -491,7 +771,7 @@ class Rsync(Command):
                 rsync_args.remove('--checksum')
             self._rsync_ignore_vanished_files(*rsync_args, check=True)
 
-            # TODO: remove debug output when the procedure is marked as 'stable'
+            # TODO: remove debug output
             # Restore the original arguments for rsync
             self.args = orig_args
         finally:
@@ -517,3 +797,79 @@ class RsyncPgData(Rsync):
         if args:
             options += args
         Rsync.__init__(self, rsync, args=options, **kwargs)
+
+
+class PgReceiveXlog(Command):
+    """
+    Wrapper class for pg_receivexlog
+    """
+
+    def __init__(self,
+                 receivexlog='pg_receivexlog',
+                 conn_string=None,
+                 dest=None,
+                 args=None,
+                 check=True,
+                 **kwargs):
+        options = [
+            "--dbname=%s" % conn_string,
+            "--verbose",
+            "--no-loop",
+            "--directory=%s" % dest]
+        if args:
+            options += args
+        Command.__init__(self, receivexlog, args=options, check=check,
+                         **kwargs)
+        self.enable_signal_forwarding(signal.SIGINT)
+        self.enable_signal_forwarding(signal.SIGTERM)
+
+
+class BarmanSubProcess(object):
+    """
+    Wrapper class for barman sub instances
+    """
+
+    def __init__(self, command=sys.argv[0], subcommand=None,
+                 config=None, args=None):
+        """
+        Build a specific wrapper for all the barman sub-commands,
+        providing an unified interface.
+
+        :param str command: path to barman
+        :param str subcommand: the barman sub-command
+        :param str config: path to the barman configuration file.
+        :param list[str] args: a list containing the sub-command args
+            like the target server name
+        """
+        # The config argument is needed when the user explicitly
+        # passes a configuration file, as the child process
+        # must know the configuration file to use.
+        #
+        # The configuration file must always be propagated,
+        # even in case of the default one.
+        if not config:
+            raise CommandFailedException(
+                "No configuration file passed to barman subprocess")
+        # Build the sub-command:
+        # * be sure to run it with the right python interpreter
+        # * pass the current configuration file with -c
+        # * set it quiet with -q
+        self.command = [sys.executable, command,
+                        '-c', config, '-q', subcommand]
+        # Handle args for the sub-command (like the server name)
+        if args:
+            self.command += args
+
+    def execute(self):
+        """
+        Execute the command and pass the output to the configured handlers
+        """
+        _logger.debug("BarmanSubProcess: %r", self.command)
+        # Redirect all descriptors to /dev/null
+        devnull = open(os.devnull, 'a+')
+        proc = subprocess.Popen(
+            self.command,
+            preexec_fn=os.setsid, close_fds=True,
+            stdin=devnull, stdout=devnull, stderr=devnull)
+        _logger.debug("BarmanSubProcess: subprocess started. pid: %s",
+                      proc.pid)

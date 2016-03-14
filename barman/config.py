@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2011-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -19,16 +19,23 @@
 This module is responsible for all the things related to
 Barman configuration, such as parsing configuration file.
 """
-import inspect
-import collections
 
+import collections
+import datetime
+import inspect
+import logging.handlers
 import os
 import re
-from ConfigParser import ConfigParser, NoOptionError
-import logging.handlers
+import sys
 from glob import iglob
+
 from barman import output
-import datetime
+
+try:
+    from ConfigParser import ConfigParser, NoOptionError
+except ImportError:
+    from configparser import ConfigParser, NoOptionError
+
 
 # create a namedtuple object called PathConflict with 'label' and 'server'
 PathConflict = collections.namedtuple('PathConflict', 'label server')
@@ -42,8 +49,8 @@ DEFAULT_LOG_LEVEL = logging.INFO
 DEFAULT_LOG_FORMAT = "%(asctime)s [%(process)s] %(name)s " \
                      "%(levelname)s: %(message)s"
 
-_TRUE_RE = re.compile(r"""^(true|t|yes|1)$""", re.IGNORECASE)
-_FALSE_RE = re.compile(r"""^(false|f|no|0)$""", re.IGNORECASE)
+_TRUE_RE = re.compile(r"""^(true|t|yes|1|on)$""", re.IGNORECASE)
+_FALSE_RE = re.compile(r"""^(false|f|no|0|off)$""", re.IGNORECASE)
 _TIME_INTERVAL_RE = re.compile(r"""
       ^\s*
       (\d+)\s+(day|month|week)s?  # N (day|month|week) with optional 's'
@@ -51,6 +58,9 @@ _TIME_INTERVAL_RE = re.compile(r"""
       """, re.IGNORECASE | re.VERBOSE)
 
 REUSE_BACKUP_VALUES = ('copy', 'link', 'off')
+
+# Possible copy methods for backups (must be all lowercase)
+BACKUP_METHOD_VALUES = ['rsync', 'postgres']
 
 
 class CsvOption(set):
@@ -102,7 +112,7 @@ class CsvOption(set):
                                      (val, key, source, val,
                                       self.conflicts[val]))
                 else:
-                    #otherwise use parsed value
+                    # otherwise use parsed value
                     self.add(val)
             else:
                 # not allowed value, reject the configuration
@@ -133,7 +143,7 @@ class BackupOptions(CsvOption):
     EXCLUSIVE_BACKUP = 'exclusive_backup'
     CONCURRENT_BACKUP = 'concurrent_backup'
 
-    #list holding all the allowed values for the BackupOption class
+    # list holding all the allowed values for the BackupOption class
     value_list = [EXCLUSIVE_BACKUP, CONCURRENT_BACKUP]
     # map holding all the possible conflicts between the allowed values
     conflicts = {
@@ -151,6 +161,18 @@ class BackupOptions(CsvOption):
                              "key %s in %s: it must contain either "
                              "exclusive_backup or concurrent_backup option"
                              % (key, source))
+
+
+class RecoveryOptions(CsvOption):
+    """
+    Extends CsvOption class providing all the details for the recovery_options
+    field
+    """
+    # constants containing labels for allowed values
+    GET_WAL = 'get-wal'
+
+    # list holding all the allowed values for the RecoveryOptions class
+    value_list = [GET_WAL]
 
 
 def parse_boolean(value):
@@ -218,56 +240,124 @@ def parse_reuse_backup(value):
             "', '".join(REUSE_BACKUP_VALUES[:-1]), REUSE_BACKUP_VALUES[-1]))
 
 
+def parse_backup_method(value):
+    """
+    Parse a string to a valid backup_method value.
+
+    Valid values are contained in BACKUP_METHOD_VALUES list
+
+    :param str value: backup_method value
+    :raises ValueError: if the value is invalid
+    """
+    if value is None:
+        return None
+    if value.lower() in BACKUP_METHOD_VALUES:
+        return value.lower()
+    raise ValueError(
+        "Invalid value (must be one in: '%s')" % (
+            "', '".join(BACKUP_METHOD_VALUES)))
+
+
 class ServerConfig(object):
     """
     This class represents the configuration for a specific Server instance.
     """
 
     KEYS = [
-        'active', 'description', 'ssh_command', 'conninfo',
-        'backup_directory', 'basebackups_directory', 'disabled',
-        'wals_directory', 'incoming_wals_directory',
-        'compression', 'custom_compression_filter',
-        'custom_decompression_filter', 'retention_policy_mode',
-        'retention_policy',
-        'wal_retention_policy', 'pre_backup_script', 'post_backup_script',
-        'pre_archive_script', 'post_archive_script',
-        'minimum_redundancy', 'bandwidth_limit', 'tablespace_bandwidth_limit',
-        'reuse_backup',
-        'backup_options', 'immediate_checkpoint', 'network_compression',
-        'basebackup_retry_times', 'basebackup_retry_sleep',
+        'active',
+        'archiver',
+        'backup_directory',
+        'backup_method',
+        'backup_options',
+        'bandwidth_limit',
+        'basebackup_retry_sleep',
+        'basebackup_retry_times',
+        'basebackups_directory',
+        'compression',
+        'conninfo',
+        'custom_compression_filter',
+        'custom_decompression_filter',
+        'description',
+        'disabled',
+        'errors_directory',
+        'immediate_checkpoint',
+        'incoming_wals_directory',
         'last_backup_maximum_age',
+        'minimum_redundancy',
+        'network_compression',
+        'path_prefix',
+        'post_archive_retry_script',
+        'post_archive_script',
+        'post_backup_retry_script',
+        'post_backup_script',
+        'pre_archive_retry_script',
+        'pre_archive_script',
+        'pre_backup_retry_script',
+        'pre_backup_script',
+        'recovery_options',
+        'retention_policy',
+        'retention_policy_mode',
+        'reuse_backup',
+        'ssh_command',
+        'streaming_archiver',
+        'streaming_conninfo',
+        'streaming_wals_directory',
+        'tablespace_bandwidth_limit',
+        'wal_retention_policy',
+        'wals_directory'
     ]
 
     BARMAN_KEYS = [
-        'compression', 'custom_compression_filter',
-        'custom_decompression_filter', 'retention_policy_mode',
-        'retention_policy',
-        'wal_retention_policy', 'pre_backup_script', 'post_backup_script',
-        'pre_archive_script', 'post_archive_script',
+        'archiver',
+        'backup_method',
+        'backup_options',
+        'bandwidth_limit',
+        'basebackup_retry_sleep',
+        'basebackup_retry_times',
+        'compression',
         'configuration_files_directory',
-        'minimum_redundancy', 'bandwidth_limit', 'tablespace_bandwidth_limit',
-        'reuse_backup',
-        'backup_options', 'immediate_checkpoint', 'network_compression',
-        'basebackup_retry_times', 'basebackup_retry_sleep',
+        'custom_compression_filter',
+        'custom_decompression_filter',
+        'immediate_checkpoint',
         'last_backup_maximum_age',
+        'minimum_redundancy',
+        'network_compression',
+        'path_prefix',
+        'post_archive_script',
+        'post_backup_script',
+        'pre_archive_script',
+        'pre_backup_script',
+        'recovery_options',
+        'retention_policy',
+        'retention_policy_mode',
+        'reuse_backup',
+        'streaming_archiver',
+        'tablespace_bandwidth_limit',
+        'wal_retention_policy'
     ]
 
     DEFAULTS = {
         'active': 'true',
-        'disabled': 'false',
-        'backup_directory': r'%(barman_home)s/%(name)s',
-        'basebackups_directory': r'%(backup_directory)s/base',
-        'wals_directory': r'%(backup_directory)s/wals',
-        'incoming_wals_directory': r'%(backup_directory)s/incoming',
-        'retention_policy_mode': 'auto',
-        'wal_retention_policy': 'main',
-        'minimum_redundancy': '0',
+        'archiver': 'on',
+        'backup_directory': '%(barman_home)s/%(name)s',
+        'backup_method': 'rsync',
         'backup_options': "%s" % BackupOptions.EXCLUSIVE_BACKUP,
-        'immediate_checkpoint': 'false',
-        'network_compression': 'false',
-        'basebackup_retry_times': '0',
         'basebackup_retry_sleep': '30',
+        'basebackup_retry_times': '0',
+        'basebackups_directory': '%(backup_directory)s/base',
+        'disabled': 'false',
+        'errors_directory': '%(backup_directory)s/errors',
+        'immediate_checkpoint': 'false',
+        'incoming_wals_directory': '%(backup_directory)s/incoming',
+        'minimum_redundancy': '0',
+        'network_compression': 'false',
+        'recovery_options': '',
+        'retention_policy_mode': 'auto',
+        'streaming_conninfo': '%(conninfo)s',
+        'streaming_archiver': 'off',
+        'streaming_wals_directory': '%(backup_directory)s/streaming',
+        'wal_retention_policy': 'main',
+        'wals_directory': '%(backup_directory)s/wals'
     }
 
     FIXED = [
@@ -276,14 +366,18 @@ class ServerConfig(object):
 
     PARSERS = {
         'active': parse_boolean,
+        'archiver': parse_boolean,
+        'backup_method': parse_backup_method,
+        'backup_options': BackupOptions,
+        'basebackup_retry_sleep': int,
+        'basebackup_retry_times': int,
         'disabled': parse_boolean,
         'immediate_checkpoint': parse_boolean,
-        'network_compression': parse_boolean,
-        'backup_options': BackupOptions,
-        'reuse_backup': parse_reuse_backup,
-        'basebackup_retry_times': int,
-        'basebackup_retry_sleep': int,
         'last_backup_maximum_age': parse_time_interval,
+        'network_compression': parse_boolean,
+        'recovery_options': RecoveryOptions,
+        'reuse_backup': parse_reuse_backup,
+        'streaming_archiver': parse_boolean,
     }
 
     def invoke_parser(self, key, source, value, new_value):
@@ -320,7 +414,7 @@ class ServerConfig(object):
                     value = parser(new_value, key, source)
                 else:
                     value = parser(new_value)
-            except Exception, e:
+            except Exception as e:
                 output.warning("Invalid configuration value '%s' for key %s"
                                " in %s: %s",
                                value, key, source, e)
@@ -363,7 +457,7 @@ class ServerConfig(object):
                 value = self.invoke_parser(key, source, value, new_value)
             # An empty string is a None value (bypassing inheritance
             # from global configuration)
-            if value is not None and value == '':
+            if value is not None and value == '' or value == 'None':
                 value = None
             setattr(self, key, value)
 
@@ -398,14 +492,24 @@ class Config(object):
             if hasattr(filename, 'read'):
                 self._config.readfp(filename)
             else:
+                # check for the existence of the user defined file
+                if not os.path.exists(filename):
+                    sys.exit("Configuration file '%s' does not exist" %
+                             filename)
                 self._config.read(os.path.expanduser(filename))
         else:
+            # Check for the presence of configuration files
+            # inside default directories
             for path in self.CONFIG_FILES:
                 full_path = os.path.expanduser(path)
                 if os.path.exists(full_path) \
                         and full_path in self._config.read(full_path):
                     filename = full_path
                     break
+            else:
+                sys.exit("Could not find any configuration file at "
+                         "default locations.\n"
+                         "Check Barman's documentation for more help.")
         self.config_file = filename
         self._servers = None
         self.servers_msg_list = []
@@ -436,7 +540,8 @@ class Config(object):
             'barman', 'barman_lock_directory') or self.barman_home
         self.user = self.get('barman', 'barman_user') or DEFAULT_USER
         self.log_file = self.get('barman', 'log_file')
-        self.log_format = self.get('barman', 'log_format') or DEFAULT_LOG_FORMAT
+        self.log_format = self.get(
+            'barman', 'log_format') or DEFAULT_LOG_FORMAT
         self.log_level = self.get('barman', 'log_level') or DEFAULT_LOG_LEVEL
         # save the raw barman section to be compared later in
         # _is_global_config_changed() method
@@ -532,38 +637,70 @@ class Config(object):
                 continue
 
             # Paths map
+            section_conf = self._servers[section]
             config_paths = {
-                'backup_directory': self._servers[section].backup_directory,
-                'basebackups_directory': self._servers[section].basebackups_directory,
-                'wals_directory': self._servers[section].wals_directory,
-                'incoming_wals_directory': self._servers[section].incoming_wals_directory,
+                'backup_directory':
+                    section_conf.backup_directory,
+                'basebackups_directory':
+                    section_conf.basebackups_directory,
+                'errors_directory':
+                    section_conf.errors_directory,
+                'incoming_wals_directory':
+                    section_conf.incoming_wals_directory,
+                'streaming_wals_directory':
+                    section_conf.streaming_wals_directory,
+                'wals_directory':
+                    section_conf.wals_directory,
             }
 
             # Check for path errors
-            for label, path in sorted(config_paths.iteritems()):
+            for label, path in sorted(config_paths.items()):
                 # If the path does not conflict with the others, add it to the
                 # paths map
-                if path not in servers_paths:
-                    servers_paths[path] = PathConflict._make([label, section])
+                real_path = os.path.realpath(path)
+                if real_path not in servers_paths:
+                    servers_paths[real_path] = PathConflict(label, section)
                 else:
-                    if section == servers_paths[path][1]:
+                    if section == servers_paths[real_path].server:
                         # Internal path error.
                         # Insert the error message into the server.msg_list
-                        self._servers[section].msg_list.append(
-                            "Conflicting path: %s=%s conflicts with "
-                            "'%s' for server '%s'" % (label, path,
-                            servers_paths[path].label, servers_paths[path].server))
+                        if real_path == path:
+                            self._servers[section].msg_list.append(
+                                "Conflicting path: %s=%s conflicts with "
+                                "'%s' for server '%s'" % (
+                                    label, path,
+                                    servers_paths[real_path].label,
+                                    servers_paths[real_path].server))
+                        else:
+                            # Symbolic link
+                            self._servers[section].msg_list.append(
+                                "Conflicting path: %s=%s (symlink to: %s) "
+                                "conflicts with '%s' for server '%s'" % (
+                                    label, path, real_path,
+                                    servers_paths[real_path].label,
+                                    servers_paths[real_path].server))
                         # Disable the server
                         self._servers[section].disabled = True
                     else:
                         # Global path error.
                         # Insert the error message into the global msg_list
-                        self.servers_msg_list.append(
-                            "Conflicting path: "
-                            "%s=%s for server '%s' conflicts with "
-                            "'%s' for server '%s'" %
-                            (label, path, section, servers_paths[path].label,
-                             servers_paths[path].server))
+                        if real_path == path:
+                            self.servers_msg_list.append(
+                                "Conflicting path: "
+                                "%s=%s for server '%s' conflicts with "
+                                "'%s' for server '%s'" % (
+                                    label, path, section,
+                                    servers_paths[real_path].label,
+                                    servers_paths[real_path].server))
+                        else:
+                            # Symbolic link
+                            self.servers_msg_list.append(
+                                "Conflicting path: "
+                                "%s=%s (symlink to: %s) for server '%s' "
+                                "conflicts with '%s' for server '%s'" % (
+                                    label, path, real_path, section,
+                                    servers_paths[real_path].label,
+                                    servers_paths[real_path].server))
 
     def server_names(self):
         """This method returns a list of server names"""
@@ -633,13 +770,13 @@ class Config(object):
 # easy raw config diagnostic with python -m
 # noinspection PyProtectedMember
 def _main():
-    print "Active configuration settings:"
+    print("Active configuration settings:")
     r = Config()
     r.load_configuration_files_directory()
     for section in r._config.sections():
-        print "Section: %s" % section
+        print("Section: %s" % section)
         for option in r._config.options(section):
-            print "\t%s = %s " % (option, r.get(section, option))
+            print("\t%s = %s " % (option, r.get(section, option)))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# Copyright (C) 2013-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2013-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -17,12 +17,15 @@
 
 import errno
 import fcntl
+import os
 
-from mock import patch, ANY
 import pytest
+from mock import ANY, patch
 
-from barman.lockfile import LockFile, LockFileBusy, LockFilePermissionDenied, \
-    GlobalCronLock, ServerBackupLock, ServerCronLock, ServerXLOGDBLock
+from barman.lockfile import (GlobalCronLock, LockFile, LockFileBusy,
+                             LockFilePermissionDenied, ServerBackupLock,
+                             ServerCronLock, ServerWalReceiveLock,
+                             ServerXLOGDBLock)
 
 
 def _prepare_fnctl_mock(fcntl_mock, exception=None):
@@ -92,7 +95,7 @@ class TestLockFileBehavior(object):
 
         # set flock to raise an unexpected OSError exception (errno = EINVAL)
         _prepare_fnctl_mock(fcntl_mock, OSError(errno.EINVAL, '', ''))
-        # Expect the acquire method to pass teh raised exception.
+        # Expect the acquire method to pass the raised exception.
         # This is the expected behaviour if the raise_if_fail flag is set to
         # True and an unexpected exception is raised
         with pytest.raises(OSError):
@@ -207,6 +210,27 @@ class TestLockFileBehavior(object):
         # Check that the fcntl.flock() have been called using the flag LOCK_UN
         fcntl_mock.flock.assert_called_once_with(ANY, fcntl.LOCK_UN)
 
+    def test_owner_pid(self, fcntl_mock, tmpdir):
+        """
+        Test the get_owner_pid method. It should return the PID of the running
+        process if a lock is already acquired
+        """
+        lock_file_path = tmpdir.join("test_lock_file1")
+        # Force te lock to return a 'busy' state
+        _prepare_fnctl_mock(fcntl_mock, [
+            # first lock attempt: success
+            None,
+            # second lock attempt: failed (already locked)
+            OSError(errno.EAGAIN, '', ''),
+            # Unlocking the first lock
+            None])
+        # Acquire a lock
+        with LockFile(lock_file_path.strpath):
+            # Create another lock and get the pid
+            second_lock_file = LockFile(lock_file_path.strpath)
+            pid = second_lock_file.get_owner_pid()
+        # Pid should contain the current pid
+        assert pid == os.getpid()
 
 
 # noinspection PyMethodMayBeStatic
@@ -215,8 +239,9 @@ class TestLockFile(object):
     """
     This class test a raw LockFile object.
 
-    It runs without mocking the fcntl.flock() method, so it could end up waiting
-    forever if something goes wrong. To avoid it we use a timeout of one second.
+    It runs without mocking the fcntl.flock() method, so it could end up
+    waiting forever if something goes wrong. To avoid it we use
+    a timeout of one second.
     """
 
     def test_init_with_minimal_params(self):
@@ -274,7 +299,8 @@ class TestLockFile(object):
         Test lock acquisition using direct methods.
 
          * Create a LockFile, and acquire the lock.
-         * Create a second LockFile and try to acquire the lock. It should fail.
+         * Create a second LockFile and try to acquire the lock.
+           It should fail.
          * Release the first lock and try acquiring the lock with the second
            one. It should now succeed.
         """
@@ -325,7 +351,7 @@ class TestLockFileSubclasses(object):
         lock = ServerCronLock(tmpdir.strpath, 'server_name')
         assert lock.filename == tmpdir.join('.server_name-cron.lock')
         assert lock.raise_if_fail
-        assert lock.wait
+        assert not lock.wait
 
     def test_server_xlogdb_lock(self, tmpdir):
         """
@@ -335,3 +361,12 @@ class TestLockFileSubclasses(object):
         assert lock.filename == tmpdir.join('.server_name-xlogdb.lock')
         assert lock.raise_if_fail
         assert lock.wait
+
+    def test_server_wal_receive_lock(self, tmpdir):
+        """
+        Tests for ServerCronLock class
+        """
+        lock = ServerWalReceiveLock(tmpdir.strpath, 'server_name')
+        assert lock.filename == tmpdir.join('.server_name-receive-wal.lock')
+        assert lock.raise_if_fail
+        assert not lock.wait

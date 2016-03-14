@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2011-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -15,8 +15,9 @@
 # You should have received a copy of the GNU General Public License
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
-""" This module contains functions to retrieve information
-about xlog files
+"""
+This module contains functions to retrieve information about xlog
+files
 """
 
 import os
@@ -28,7 +29,11 @@ _xlog_re = re.compile(r'''
     ([\dA-Fa-f]{8})                    # everything has a timeline
     (?:
         ([\dA-Fa-f]{8})([\dA-Fa-f]{8}) # segment name, if a wal file
-        (?:\.[\dA-Fa-f]{8}\.backup)?   # and optional offset, if a backup label
+        (?:                            # and optional
+            \.[\dA-Fa-f]{8}\.backup    # offset, if a backup label
+        |
+            \.partial                  # partial, if a partial file
+        )?
     |
         \.history                      # or only .history, if a history file
     )
@@ -96,6 +101,21 @@ def is_backup_file(path):
     return False
 
 
+def is_partial_file(path):
+    """
+    Return True if the xlog is a .partial file, False otherwise
+
+    It supports either a full file path or a simple file name.
+
+    :param str path: the file name to test
+    :rtype: bool
+    """
+    match = _xlog_re.search(os.path.basename(path))
+    if match and match.group(0).endswith('.partial'):
+        return True
+    return False
+
+
 def is_wal_file(path):
     """
     Return True if the xlog is a regular xlog file, False otherwise
@@ -106,25 +126,28 @@ def is_wal_file(path):
     :rtype: bool
     """
     match = _xlog_re.search(os.path.basename(path))
-    if match \
-            and not match.group(0).endswith('.backup')\
-            and not match.group(0).endswith('.history'):
+    if (match and
+            not match.group(0).endswith('.backup') and
+            not match.group(0).endswith('.history') and
+            not match.group(0).endswith('.partial')):
         return True
     return False
 
 
 def decode_segment_name(path):
     """
-    Retrieve the timeline, log ID and segment ID from the name of a xlog segment
+    Retrieve the timeline, log ID and segment ID
+    from the name of a xlog segment
 
     It can handle either a full file path or a simple file name.
 
     :param str path: the file name to decode
     :rtype: list[int]
     """
-    match = _xlog_re.match(os.path.basename(path))
+    name = os.path.basename(path)
+    match = _xlog_re.match(name)
     if not match:
-        raise BadXlogSegmentName("invalid xlog segment name '%s'" % path)
+        raise BadXlogSegmentName(name)
     return [int(x, 16) if x else None for x in match.groups()]
 
 
@@ -149,31 +172,43 @@ def encode_history_file_name(tli):
     return "%08X.history" % (tli,)
 
 
-def enumerate_segments(begin, end, version):
+def generate_segment_names(begin, end=None, version=None):
     """
-    Get the list of xlog segments from begin to end (included)
+    Generate a sequence of XLOG segments starting from ``begin``
+    If an ``end`` segment is provided the sequence will terminate after
+    returning it, otherwise the sequence will never terminate.
 
     :param str begin: begin segment name
-    :param str end: end segment name
-    :param int version: postgres version as an integer (e.g. 90301 for 9.3.1)
+    :param str|None end: optional end segment name
+    :param int|None version: optional postgres version as an integer
+        (e.g. 90301 for 9.3.1)
     :rtype: collections.Iterable[str]
+    :raise: BadXlogSegmentName
     """
     begin_tli, begin_log, begin_seg = decode_segment_name(begin)
-    end_tli, end_log, end_seg = decode_segment_name(end)
+    end_tli, end_log, end_seg = None, None, None
+    if end:
+        end_tli, end_log, end_seg = decode_segment_name(end)
 
-    # this method don't support timeline changes
-    assert begin_tli == end_tli, (
-        "Begin segment (%s) and end segment (%s) "
-        "must have the same timeline part" % (begin, end))
+        # this method doesn't support timeline changes
+        assert begin_tli == end_tli, (
+            "Begin segment (%s) and end segment (%s) "
+            "must have the same timeline part" % (begin, end))
 
-    # Start from the first xlog and sequentially enumerates the segments
-    # to the end
+    # If version is less than 9.3 the last segmen must be skipped
+    skip_last_segment = version is not None and version < 90300
+
+    # Start from the first xlog and generate the segments sequentially
+    # If ``end`` has been provided, the while condition ensure the termination
+    # otherwise this generator will never stop
     cur_log, cur_seg = begin_log, begin_seg
-    while cur_log < end_log or (cur_log == end_log and cur_seg <= end_seg):
+    while end is None or \
+            cur_log < end_log or \
+            (cur_log == end_log and cur_seg <= end_seg):
         yield encode_segment_name(begin_tli, cur_log, cur_seg)
         cur_seg += 1
         if cur_seg > XLOG_SEG_PER_FILE or (
-                version < 90300 and cur_seg == XLOG_SEG_PER_FILE):
+                skip_last_segment and cur_seg == XLOG_SEG_PER_FILE):
             cur_seg = 0
             cur_log += 1
 

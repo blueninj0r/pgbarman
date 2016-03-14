@@ -1,4 +1,4 @@
-# Copyright (C) 2013-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2013-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -14,13 +14,15 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
-import ast
 
-import os
-import dateutil.parser
-import dateutil.tz
+import ast
 import collections
 import logging
+import os
+
+import dateutil.parser
+import dateutil.tz
+
 from barman import xlog
 from barman.compression import identify_compression
 
@@ -58,6 +60,16 @@ def load_tablespace_list(string):
         return [Tablespace._make(item) for item in obj]
     else:
         return None
+
+
+def null_repr(obj):
+    """
+    Return the literal representation of an object
+
+    :param object obj: object to represent
+    :return str|None: Literal representation of an object or None
+    """
+    return repr(obj) if obj else None
 
 
 def load_datetime_tz(time_str):
@@ -143,6 +155,10 @@ class FieldListFile(object):
         The constructor build the object assigning every keyword argument to
         the corresponding attribute. If a provided keyword argument doesn't
         has a corresponding attribute an AttributeError exception is raised.
+
+        The values provided to the constructor must be of the appropriate
+        type for the corresponding attribute.
+        The constructor will not attempt any validation or conversion on them.
 
         This class is meant to be an abstract base class.
 
@@ -288,7 +304,7 @@ class WalFileInfo(FieldListFile):
     Metadata of a WAL file.
     """
 
-    __slots__ = ()
+    __slots__ = ('orig_filename',)
 
     name = Field('name', doc='base name of WAL file')
     size = Field('size', load=int, doc='WAL file size after compression')
@@ -318,6 +334,7 @@ class WalFileInfo(FieldListFile):
                 or default_compression
         obj = cls(**kwargs)
         obj.filename = "%s.meta" % filename
+        obj.orig_filename = filename
         return obj
 
     def to_xlogdb_line(self):
@@ -335,7 +352,6 @@ class WalFileInfo(FieldListFile):
         """
         Parse a line from xlog catalogue
 
-        :param Server server: server object
         :param str line: a line in the wal database to parse
         :rtype: WalFileInfo
         """
@@ -377,7 +393,6 @@ class WalFileInfo(FieldListFile):
         return os.path.join(server.config.wals_directory, self.relpath())
 
 
-
 class UnknownBackupIdException(Exception):
     """
     The searched backup_id doesn't exists
@@ -399,6 +414,7 @@ class BackupInfo(FieldListFile):
     DONE = 'DONE'
     STATUS_ALL = (EMPTY, STARTED, DONE, FAILED)
     STATUS_NOT_EMPTY = (STARTED, DONE, FAILED)
+    STATUS_ARCHIVING = (STARTED, DONE)
 
     #: Status according to retention policies
     OBSOLETE = 'OBSOLETE'
@@ -432,13 +448,14 @@ class BackupInfo(FieldListFile):
     config_file = Field('config_file')
     hba_file = Field('hba_file')
     ident_file = Field('ident_file')
-    backup_label = Field('backup_label', load=ast.literal_eval, dump=repr)
+    included_files = Field('included_files',
+                           load=ast.literal_eval, dump=null_repr)
+    backup_label = Field('backup_label', load=ast.literal_eval, dump=null_repr)
 
     __slots__ = ('server', 'config', 'backup_manager',
                  'backup_id', 'backup_version')
 
     def __init__(self, server, info_file=None, backup_id=None, **kwargs):
-        # Initialises the attributes for the object based on the predefined keys
         """
         Stores meta information about a single backup
 
@@ -448,7 +465,8 @@ class BackupInfo(FieldListFile):
         :raise BackupInfoBadInitialisation: if the info_file content is invalid
             or neither backup_info or
         """
-
+        # Initialises the attributes for the object
+        # based on the predefined keys
         super(BackupInfo, self).__init__(**kwargs)
 
         self.server = server
@@ -469,7 +487,7 @@ class BackupInfo(FieldListFile):
                 self.load(filename=self.filename)
         elif info_file:
             if hasattr(info_file, 'read'):
-            # We have been given a file-like object
+                # We have been given a file-like object
                 self.load(file_object=info_file)
             else:
                 # Just a file name
@@ -486,15 +504,15 @@ class BackupInfo(FieldListFile):
                     os.path.join(self.get_basebackup_directory(), 'pgdata')):
                 self.backup_version = 1
         except Exception as e:
-            _logger.warning("Error detecting backup_version, use default: 2.\n "
-                            "Failure reason: %s", e)
+            _logger.warning("Error detecting backup_version, "
+                            "use default: 2. Failure reason: %s", e)
 
     def get_required_wal_segments(self):
         """
         Get the list of required WAL segments for the current backup
         """
-        return xlog.enumerate_segments(self.begin_wal, self.end_wal,
-                                       self.version)
+        return xlog.generate_segment_names(self.begin_wal, self.end_wal,
+                                           self.version)
 
     def get_list_of_files(self, target):
         """
@@ -588,7 +606,8 @@ class BackupInfo(FieldListFile):
             dir_name = os.path.dirname(filename)
             if not os.path.exists(dir_name):
                 os.makedirs(dir_name)
-        super(BackupInfo, self).save(filename=filename, file_object=file_object)
+        super(BackupInfo, self).save(filename=filename,
+                                     file_object=file_object)
 
     def to_dict(self):
         """
@@ -603,6 +622,36 @@ class BackupInfo(FieldListFile):
 
     def to_json(self):
         """
-        Return an equivalent dictionary that can be encoded in json
+        Return an equivalent dictionary that uses only json-supported types
         """
-        return self.to_dict()
+        data = self.to_dict()
+        # Convert fields which need special types not supported by json
+        if data.get('tablespaces') is not None:
+            data['tablespaces'] = [list(item)
+                                   for item in data['tablespaces']]
+        if data.get('begin_time') is not None:
+            data['begin_time'] = data['begin_time'].ctime()
+        if data.get('end_time') is not None:
+            data['end_time'] = data['end_time'].ctime()
+        return data
+
+    @classmethod
+    def from_json(cls, server, json_backup_info):
+        """
+        Factory method that builds a BackupInfo object
+        from a json dictionary
+
+        :param barman.Server server: the server related to the Backup
+        :param dict json_backup_info: the data set containing values from json
+        """
+        data = dict(json_backup_info)
+        # Convert fields which need special types not supported by json
+        if data.get('tablespaces') is not None:
+            data['tablespaces'] = [Tablespace._make(item)
+                                   for item in data['tablespaces']]
+        if data.get('begin_time') is not None:
+            data['begin_time'] = load_datetime_tz(data['begin_time'])
+        if data.get('end_time') is not None:
+            data['end_time'] = load_datetime_tz(data['end_time'])
+        # Instantiate a BackupInfo object using the converted fields
+        return cls(server, **data)

@@ -1,16 +1,22 @@
-all: barman.1 barman.5
+MANPAGES=barman.1 barman.5
+DOCS=barman-tutorial.en.pdf barman-tutorial.en.html
 
-CMD=a2x
-OPTS=-d manpage -f manpage
+all: $(MANPAGES) $(DOCS)
 
-barman.1: barman.1.asciidoc
-	    $(CMD) $(OPTS) $<
+barman-tutorial.en.pdf: barman-tutorial.en.md
+	pandoc $< -o $@ -s -f markdown
 
-barman.5: barman.5.asciidoc
-	    $(CMD) $(OPTS) $<
+barman-tutorial.en.html: barman-tutorial.en.md
+	pandoc -o $@ -t html5 -f markdown -s -S --toc $<
+
+barman.1: barman.1.md
+	pandoc -s -t man -o $@ $<
+
+barman.5: barman.5.md
+	pandoc -s -t man -o $@ $<
 
 clean:
-	    rm -f barman.1 barman.5 
+	    rm -f $(MANPAGES) $(DOCS)
 
 help:
 	    @echo "Usage:"

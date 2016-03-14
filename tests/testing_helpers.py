@@ -1,4 +1,4 @@
-# Copyright (C) 2014-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2014-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -16,18 +16,19 @@
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
 from datetime import datetime, timedelta
-try:
-    from cStringIO import StringIO
-except ImportError:
-    from io import StringIO
 
 import mock
 from dateutil import tz
 
 from barman.backup import BackupManager
-from barman.config import Config
+from barman.config import BackupOptions, Config
 from barman.infofile import BackupInfo, Tablespace
 from barman.server import Server
+
+try:
+    from cStringIO import StringIO
+except ImportError:
+    from io import StringIO
 
 
 def build_test_backup_info(
@@ -49,6 +50,7 @@ def build_test_backup_info(
         server_name='test_server',
         size=12345,
         status=BackupInfo.DONE,
+        included_files=None,
         tablespaces=(
             ('tbs1', 16387, '/fake/location'),
             ('tbs2', 16405, '/another/location'),
@@ -81,6 +83,7 @@ def build_test_backup_info(
     :param str server_name: server name for the backup
     :param int size: dimension of the backup
     :param str status: status of the execution of the backup
+    :param list|None included_files: a list of extra configuration files
     :param list|tuple|None tablespaces: a list of tablespaces for the backup
     :param int timeline: timeline of the backup
     :param int version: postgres version of the backup
@@ -198,6 +201,73 @@ def build_config_from_dicts(global_conf=None, main_conf=None,
     config = Config(config_file)
     config.config_file = config_name or 'build_config_from_dicts'
     return config
+
+
+def build_config_dictionary(config_keys=None):
+    """
+    Utility method, generate a dict useful for config comparison
+
+    It has a 'basic' format and every key could be overwritten the
+    config_keys parameter.
+
+    :param dict[str,str|None]|None config_keys: using this dictionary
+        it is possible to override or add new values to the base dictionary.
+    :return dict: a dictionary representing a barman configuration
+    """
+    # Basic dictionary
+    base_config = {
+        'active': True,
+        'archiver': True,
+        'config': None,
+        'backup_directory': '/some/barman/home/main',
+        'backup_options': BackupOptions(BackupOptions.EXCLUSIVE_BACKUP,
+                                        "", ""),
+        'bandwidth_limit': None,
+        'barman_home': '/some/barman/home',
+        'basebackups_directory': '/some/barman/home/main/base',
+        'barman_lock_directory': '/some/barman/home',
+        'compression': None,
+        'conninfo': 'host=pg01.nowhere user=postgres port=5432',
+        'backup_method': 'rsync',
+        'custom_compression_filter': None,
+        'custom_decompression_filter': None,
+        'description': ' Text with quotes ',
+        'immediate_checkpoint': False,
+        'incoming_wals_directory': '/some/barman/home/main/incoming',
+        'minimum_redundancy': '0',
+        'name': 'main',
+        'network_compression': False,
+        'post_backup_script': None,
+        'pre_backup_script': None,
+        'post_backup_retry_script': None,
+        'pre_backup_retry_script': None,
+        'recovery_options': set(),
+        'retention_policy': None,
+        'retention_policy_mode': 'auto',
+        'reuse_backup': None,
+        'ssh_command': 'ssh -c "arcfour" -p 22 postgres@pg01.nowhere',
+        'tablespace_bandwidth_limit': None,
+        'wal_retention_policy': 'main',
+        'wals_directory': '/some/barman/home/main/wals',
+        'basebackup_retry_sleep': 30,
+        'basebackup_retry_times': 0,
+        'post_archive_script': None,
+        'streaming_conninfo': 'host=pg01.nowhere user=postgres port=5432',
+        'pre_archive_script': None,
+        'post_archive_retry_script': None,
+        'pre_archive_retry_script': None,
+        'last_backup_maximum_age': None,
+        'disabled': False,
+        'msg_list': [],
+        'path_prefix': None,
+        'streaming_archiver': False,
+        'streaming_wals_directory': '/some/barman/home/main/streaming',
+        'errors_directory': '/some/barman/home/main/errors',
+    }
+    # Check for overriding keys
+    if config_keys is not None:
+        base_config.update(config_keys)
+    return base_config
 
 
 def build_real_server(global_conf=None, main_conf=None):

@@ -1,4 +1,4 @@
-# Copyright (C) 2013-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2013-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -15,20 +15,20 @@
 # You should have received a copy of the GNU General Public License
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
-from datetime import datetime, timedelta
 import logging
+from datetime import datetime, timedelta
 
 import pytest
 from dateutil.tz import tzlocal
 
 from barman.infofile import BackupInfo
-from barman.retention_policies import RetentionPolicyFactory, \
-    RedundancyRetentionPolicy, RecoveryWindowRetentionPolicy
-from testing_helpers import build_test_backup_info, build_mocked_server
+from barman.retention_policies import (RecoveryWindowRetentionPolicy,
+                                       RedundancyRetentionPolicy,
+                                       RetentionPolicyFactory)
+from testing_helpers import build_mocked_server, build_test_backup_info
 
 
 class TestRetentionPolicies(object):
-
 
     def test_redundancy_report(self, caplog):
         """
@@ -74,9 +74,9 @@ class TestRetentionPolicies(object):
         # execute retention policy report
         rp.report()
         # Check for the warning inside the log
-        caplog.setLevel(logging.WARNING)
+        caplog.set_level(logging.WARNING)
 
-        log = caplog.text()
+        log = caplog.text
         assert log.find("WARNING  Retention policy redundancy (2) "
                         "is lower than the required minimum redundancy (3). "
                         "Enforce 3.")
@@ -131,8 +131,8 @@ class TestRetentionPolicies(object):
         # execute retention policy report
         rp.report()
         # Check for the warning inside the log
-        caplog.setLevel(logging.WARNING)
-        log = caplog.text()
+        caplog.set_level(logging.WARNING)
+        log = caplog.text
         warn = "WARNING  Keeping obsolete backup test_backup2 for " \
                "server test (older than %s) due to minimum redundancy " \
                "requirements (4)\n" % rp._point_of_recoverability()

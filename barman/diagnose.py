@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2011-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -19,15 +19,15 @@
 This module represents the barman diagnostic tool.
 """
 
-import logging
 import json
+import logging
 import sys
-from barman.backup import BackupInfo
-import barman
-from barman import output
-from barman import fs
-from barman.utils import BarmanEncoder
 
+import barman
+from barman import fs, output
+from barman.backup import BackupInfo
+from barman.fs import FsOperationFailed
+from barman.utils import BarmanEncoder
 
 _logger = logging.getLogger(__name__)
 
@@ -65,8 +65,13 @@ def exec_diagnose(servers, errors_list):
         del diagnosis['servers'][name]['config']['config']
         # server system info
         if server.config.ssh_command:
-            command = fs.UnixRemoteCommand(ssh_command=server.config.ssh_command)
-            diagnosis['servers'][name]['system_info'] = command.get_system_info()
+            try:
+                command = fs.UnixRemoteCommand(
+                    ssh_command=server.config.ssh_command)
+                diagnosis['servers'][name]['system_info'] = (
+                    command.get_system_info())
+            except FsOperationFailed:
+                pass
         # barman statuts information for the server
         diagnosis['servers'][name]['status'] = server.get_remote_status()
         # backup list
@@ -74,4 +79,3 @@ def exec_diagnose(servers, errors_list):
         diagnosis['servers'][name]['backups'] = backups
     output.info(json.dumps(diagnosis, sys.stdout, cls=BarmanEncoder, indent=4,
                            sort_keys=True))
-

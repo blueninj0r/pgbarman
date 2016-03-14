@@ -1,4 +1,4 @@
-# Copyright (C) 2013-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2013-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -16,6 +16,7 @@
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
 import logging
+
 from barman.command_wrappers import Command
 
 _logger = logging.getLogger(__name__)
@@ -47,9 +48,9 @@ class UnixLocalCommand(object):
     This class is a wrapper for local calls for file system operations
     """
 
-    def __init__(self):
+    def __init__(self, path=None):
         # initialize a shell
-        self.cmd = Command(cmd='sh -c', shell=True)
+        self.cmd = Command(cmd='sh -c', shell=True, path=path)
 
     def create_dir_if_not_exists(self, dir_path):
         """
@@ -151,7 +152,8 @@ class UnixLocalCommand(object):
                     else:
                         raise FsOperationFailed('Unable to remove file')
                 else:
-                    raise FsOperationFailed('Unable to create write check file')
+                    raise FsOperationFailed(
+                        'Unable to create write check file')
             else:
                 raise FsOperationFailed('%s is not a directory' % dir_path)
         else:
@@ -259,5 +261,5 @@ class UnixRemoteCommand(UnixLocalCommand):
         self.cmd = Command(cmd=ssh_command, shell=True)
         ret = self.cmd("true")
         if ret != 0:
-            raise FsOperationFailed("Connection failed using the command '%s'" %
-                                    ssh_command)
+            raise FsOperationFailed(
+                "Connection failed using the command '%s'" % ssh_command)

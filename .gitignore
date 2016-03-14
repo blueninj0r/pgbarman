@@ -3,7 +3,8 @@
 *.pyo
 
 # python modules
-/*.egg
+*.egg
+.eggs
 
 # editor backups
 *~
@@ -15,15 +16,18 @@
 /.pydevproject
 /.settings
 
+# PyCharm
+/.idea
+
 # tox testing
-.tox
+.tox/
+.cache/
 
 # setuptools
 /MANIFEST
 /dist
 /build
 /barman.egg-info
-/*.egg/
 
 # OSX
 .DS_Store

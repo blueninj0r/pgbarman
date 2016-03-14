@@ -1,7 +1,11 @@
 %if 0%{?rhel} == 7
-%global pybasever 2.7
+  %global pybasever 2.7
 %else
-%global pybasever 2.6
+  %if 0%{?fedora}>=21
+    %global pybasever 2.7
+  %else
+    %global pybasever 2.6
+  %endif
 %endif
 
 %if 0%{?rhel} == 5
@@ -16,7 +20,7 @@
 %global __python_ver python
 %endif
 
-%global main_version 1.4.1
+%global main_version 1.6.1
 # comment out the next line if not a pre-release (use '#%%global ...')
 %global extra_version a1
 # Usually 1 - unique sequence for all pre-release version
@@ -36,8 +40,8 @@ Url:		http://www.pgbarman.org/
 Source0:	%{name}-%{version}%{?extra_version:%{extra_version}}.tar.gz
 BuildRoot:	%{_tmppath}/%{name}-%{version}-%{release}-buildroot-%(%{__id_u} -n)
 BuildArch:	noarch
-Vendor:		2ndQuadrant Italia (Devise.IT S.r.l.) <info@2ndquadrant.it>
-Requires:	python-abi = %{pybasever}, %{__python_ver}-psycopg2, %{__python_ver}-argh >= 0.21.2, %{__python_ver}-argcomplete, %{__python_ver}-dateutil
+Vendor:		2ndQuadrant Italia Srl <info@2ndquadrant.it>
+Requires:	python-abi = %{pybasever}, %{__python_ver}-psycopg2 >= 2.4.2, %{__python_ver}-argh >= 0.21.2, %{__python_ver}-argcomplete, %{__python_ver}-dateutil
 Requires:	/usr/sbin/useradd
 Requires:	rsync >= 3.0.4
 
@@ -86,7 +90,7 @@ rm -rf %{buildroot}
 %files
 %defattr(-,root,root)
 %doc INSTALL NEWS README
-%{python_sitelib}/%{name}-%{version}%{?extra_version:%{extra_version}}-py%{pybasever}.egg-info/
+%{python_sitelib}/%{name}-%{version}%{?extra_version:%{extra_version}}-py%{pybasever}.egg-info
 %{python_sitelib}/%{name}/
 %{_bindir}/%{name}
 %doc %{_mandir}/man1/%{name}.1.gz
@@ -105,6 +109,30 @@ useradd -M -n -g barman -r -d /var/lib/barman -s /bin/bash \
 	-c "Backup and Recovery Manager for PostgreSQL" barman >/dev/null 2>&1 || :
 
 %changelog
+* Mon Feb 29 2016 - Marco Nenciarini <marco.nenciarini@2ndquadrant.it> 1.6.0-1
+- New release 1.6.0-1
+
+* Wed Feb 17 2016 - Gabriele Bartolini <gabriele.bartolini@2ndquadrant.it> 1.6.0-0.3.beta.3
+- New release 1.6.0-0.3.beta.3
+
+* Wed Feb 10 2016 - Gabriele Bartolini <gabriele.bartolini@2ndquadrant.it> 1.6.0-0.2.beta.2
+- New release 1.6.0-0.2.beta.2
+
+* Mon Feb  1 2016 - Marco Nenciarini <marco.nenciarini@2ndquadrant.it> 1.6.0-0.1.beta.1
+- New release 1.6.0-0.1.beta.1
+
+* Mon Nov 16 2015 - Marco Nenciarini <marco.nenciarini@2ndquadrant.it> 1.5.1-1
+- New release 1.5.1
+
+* Mon Sep 28 2015 - Francesco Canovai <francesco.canovai@2ndquadrant.it> 1.5.0-1
+- New release 1.5.0
+
+* Tue Sep 15 2015 - Francesco Canovai <francesco.canovai@2ndquadrant.it> 1.5.0-0.1.a1
+- New release 1.5.0 alpha 1
+
+* Tue May  5 2015 - Francesco Canovai <francesco.canovai@2ndquadrant.it> 1.4.1-1
+- New release 1.4.1
+
 * Mon Jan 26 2015 - Francesco Canovai <francesco.canovai@2ndquadrant.it> 1.4.0-1
 - New release 1.4.0
 

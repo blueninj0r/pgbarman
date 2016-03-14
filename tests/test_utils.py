@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2011-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -15,13 +15,17 @@
 # You should have received a copy of the GNU General Public License
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
+import decimal
+import json
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
+
 import mock
+
 import barman.utils
 
 
-#noinspection PyMethodMayBeStatic
+# noinspection PyMethodMayBeStatic
 class TestDropPrivileges(object):
     def mock_pwd_entry(self, user, home, uid, gid):
         pwd_entry = mock.MagicMock(name='pwd_entry_%s' % uid)
@@ -69,8 +73,6 @@ class TestDropPrivileges(object):
 
         os.setgid.assert_called_with(gid)
         os.setuid.assert_called_with(uid)
-        os.setegid.assert_called_with(gid)
-        os.seteuid.assert_called_with(uid)
         os.setgroups.assert_called_with(
             [_id for _id in groups if groups[_id]] + [gid])
         assert os.environ['HOME'] == home
@@ -112,7 +114,7 @@ class TestDropPrivileges(object):
         assert not os.environ.__setitem__.called
 
 
-#noinspection PyMethodMayBeStatic
+# noinspection PyMethodMayBeStatic
 class TestParseLogLevel(object):
     def test_int_to_int(self):
         assert barman.utils.parse_log_level(1) == 1
@@ -130,7 +132,7 @@ class TestParseLogLevel(object):
         assert barman.utils.parse_log_level('unknown') is None
 
 
-#noinspection PyMethodMayBeStatic
+# noinspection PyMethodMayBeStatic
 @mock.patch('barman.utils.os')
 class TestMkpath(object):
     def test_path_exists(self, mock_os):
@@ -158,7 +160,7 @@ class TestMkpath(object):
         mock_os.makedirs.assert_called_with(test_path)
 
 
-#noinspection PyMethodMayBeStatic,PyUnresolvedReferences
+# noinspection PyMethodMayBeStatic,PyUnresolvedReferences
 @mock.patch.multiple('barman.utils', logging=mock.DEFAULT, mkpath=mock.DEFAULT,
                      _logger=mock.DEFAULT)
 class TestConfigureLogging(object):
@@ -171,7 +173,7 @@ class TestConfigureLogging(object):
         # check if root has an handler and a level
         logging_mock = mocks['logging']
         logging_mock.root.setLevel.assert_called_with(logging.INFO)
-        logging_mock.root.addHandler.assert_called(mock.ANY)
+        logging_mock.root.addHandler.assert_called_with(mock.ANY)
 
         # check if the handler has a formatter
         handler_mock = logging_mock.root.addHandler.call_args[0][0]
@@ -186,7 +188,7 @@ class TestConfigureLogging(object):
         # check if root has an handler and a level
         logging_mock = mocks['logging']
         logging_mock.root.setLevel.assert_called_with(logging.INFO)
-        logging_mock.root.addHandler.assert_called(mock.ANY)
+        logging_mock.root.addHandler.assert_called_with(mock.ANY)
 
         # check if the handler has a formatter
         handler_mock = logging_mock.root.addHandler.call_args[0][0]
@@ -203,7 +205,7 @@ class TestConfigureLogging(object):
         # check if root has an handler and a level
         logging_mock = mocks['logging']
         logging_mock.root.setLevel.assert_called_with(test_level)
-        logging_mock.root.addHandler.assert_called(mock.ANY)
+        logging_mock.root.addHandler.assert_called_with(mock.ANY)
 
     def test_file_format_call(self, **mocks):
         test_file = '/test/log/file.log'
@@ -216,7 +218,7 @@ class TestConfigureLogging(object):
         # check if root has an handler and a level
         logging_mock = mocks['logging']
         logging_mock.root.setLevel.assert_called_with(logging.INFO)
-        logging_mock.root.addHandler.assert_called(mock.ANY)
+        logging_mock.root.addHandler.assert_called_with(mock.ANY)
 
         # check if the handler has a formatter
         handler_mock = logging_mock.root.addHandler.call_args[0][0]
@@ -239,7 +241,7 @@ class TestConfigureLogging(object):
         # check if root has an handler and a level
         logging_mock = mocks['logging']
         logging_mock.root.setLevel.assert_called_with(logging.INFO)
-        logging_mock.root.addHandler.assert_called(mock.ANY)
+        logging_mock.root.addHandler.assert_called_with(mock.ANY)
 
         # check if the handler has a formatter
         handler_mock = logging_mock.root.addHandler.call_args[0][0]
@@ -261,7 +263,7 @@ class TestConfigureLogging(object):
 
         # check if root has an handler and a level
         logging_mock.root.setLevel.assert_called_with(logging.INFO)
-        logging_mock.root.addHandler.assert_called(mock.ANY)
+        logging_mock.root.addHandler.assert_called_with(mock.ANY)
 
         # check if the handler has a formatter
         handler_mock = logging_mock.root.addHandler.call_args[0][0]
@@ -271,7 +273,7 @@ class TestConfigureLogging(object):
         mocks['_logger'].warn.assert_called_with(mock.ANY)
 
 
-#noinspection PyMethodMayBeStatic
+# noinspection PyMethodMayBeStatic
 class TestPrettySize(object):
 
     def test_1000(self):
@@ -323,12 +325,12 @@ class TestPrettySize(object):
     def test_float(self):
 
         assert barman.utils.pretty_size(1234, 1000) == \
-               barman.utils.pretty_size(1234.0, 1000)
+            barman.utils.pretty_size(1234.0, 1000)
         assert barman.utils.pretty_size(1234, 1024) == \
-               barman.utils.pretty_size(1234.0, 1024)
+            barman.utils.pretty_size(1234.0, 1024)
 
 
-#noinspection PyMethodMayBeStatic
+# noinspection PyMethodMayBeStatic
 class TestHumanReadableDelta(object):
     """
     Test class for the utility method human_readable_timedelta.
@@ -399,6 +401,7 @@ class TestHumanReadableDelta(object):
         assert barman.utils.human_readable_timedelta(td) == '180 days, ' \
                                                             '3 hours, ' \
                                                             '4 minutes'
+
     def test_seven_days(self):
         """
         Test output for a 1 week timedelta.
@@ -406,3 +409,49 @@ class TestHumanReadableDelta(object):
         td = timedelta(weeks=1)
         assert barman.utils.human_readable_timedelta(td) == '7 days'
 
+
+# noinspection PyMethodMayBeStatic
+class TestBarmanEncoder(object):
+    """
+    Test BarmanEncoder object
+    """
+    def test_complex_objects(self):
+        """
+        Test the BarmanEncoder on special objects
+        """
+        # Test encoding with an object that provides a to_json() method
+        to_json_mock = mock.Mock(name="to_json_mock")
+        to_json_mock.to_json.return_value = "json_value"
+        assert json.dumps(
+            to_json_mock, cls=barman.utils.BarmanEncoder) == '"json_value"'
+
+        # Test encoding with an object that provides a ctime() method
+        assert json.dumps(
+            datetime(2015, 1, 10, 12, 34, 56),
+            cls=barman.utils.BarmanEncoder) == '"Sat Jan 10 12:34:56 2015"'
+
+        # Test encoding with a timedelta object
+        assert json.dumps(
+            timedelta(days=35, seconds=12345),
+            cls=barman.utils.BarmanEncoder) == '"35 days, 3 hours, 25 minutes"'
+
+        # Test encoding with a Decimal object
+        num = decimal.Decimal("123456789.9876543210")
+        assert json.dumps(
+            num, cls=barman.utils.BarmanEncoder) == repr(float(num))
+
+        # Test encoding with a raw string object (simulated)
+        string_value = mock.Mock(name="string_value", wraps="string_value")
+        string_value.attach_mock(mock.Mock(), "decode")
+        string_value.decode.return_value = "decoded_value"
+        assert json.dumps(
+            string_value, cls=barman.utils.BarmanEncoder) == '"decoded_value"'
+        string_value.decode.assert_called_once_with('utf-8', 'replace')
+
+    def test_simple_objects(self):
+        """
+        Test the BarmanEncoder on simple objects
+        """
+        assert json.dumps(
+            [{"a": 1}, "test"],
+            cls=barman.utils.BarmanEncoder) == '[{"a": 1}, "test"]'

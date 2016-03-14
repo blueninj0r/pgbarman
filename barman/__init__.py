@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2011-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -18,7 +18,10 @@
 """
 The main Barman module
 """
+
 from __future__ import absolute_import
 from .version import __version__
 
 __config__ = None
+
+__all__ = ['__version__', '__config__']

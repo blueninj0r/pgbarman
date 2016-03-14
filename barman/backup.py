@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2011-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -19,32 +19,47 @@
 This module represents a backup.
 """
 
-from glob import glob
 import datetime
 import logging
 import os
 import shutil
 import time
+from glob import glob
 
 import dateutil.parser
 import dateutil.tz
 
-from barman.infofile import WalFileInfo, BackupInfo, UnknownBackupIdException
-from barman import xlog, output
+from barman import output, xlog
+from barman.backup_executor import RsyncBackupExecutor, SshCommandException
 from barman.command_wrappers import DataTransferFailure
-from barman.compression import CompressionManager, CompressionIncompatibility
-from barman.hooks import HookScriptRunner
-from barman.utils import human_readable_timedelta, mkpath, pretty_size, \
-    fsync_dir
+from barman.compression import CompressionIncompatibility, CompressionManager
 from barman.config import BackupOptions
-from barman.backup_executor import RsyncBackupExecutor
+from barman.hooks import (AbortedRetryHookScript, HookScriptRunner,
+                          RetryHookScriptRunner)
+from barman.infofile import BackupInfo, UnknownBackupIdException, WalFileInfo
 from barman.recovery_executor import RecoveryExecutor
-
+from barman.remote_status import RemoteStatusMixin
+from barman.utils import fsync_dir, human_readable_timedelta, pretty_size
 
 _logger = logging.getLogger(__name__)
 
 
-class BackupManager(object):
+class DuplicateWalFile(Exception):
+    """
+    A duplicate WAL file has been found
+    """
+    pass
+
+
+class MatchingDuplicateWalFile(DuplicateWalFile):
+    """
+    A duplicate WAL file has been found, but it's identical to the one we
+    already have.
+    """
+    pass
+
+
+class BackupManager(RemoteStatusMixin):
     """Manager of the backup archive for a server"""
 
     DEFAULT_STATUS_FILTER = (BackupInfo.DONE,)
@@ -53,12 +68,18 @@ class BackupManager(object):
         """
         Constructor
         """
+        super(BackupManager, self).__init__()
         self.name = "default"
         self.server = server
         self.config = server.config
         self._backup_cache = None
-        self.compression_manager = CompressionManager(self.config)
-        self.executor = RsyncBackupExecutor(self)
+        self.compression_manager = CompressionManager(self.config, server.path)
+        self.executor = None
+        try:
+            self.executor = RsyncBackupExecutor(self)
+        except SshCommandException as e:
+            self.config.disabled = True
+            self.config.msg_list.append(str(e).strip())
 
     def get_available_backups(self, status_filter=DEFAULT_STATUS_FILTER):
         """
@@ -75,7 +96,7 @@ class BackupManager(object):
             self._load_backup_cache()
         # Filter the cache using the status filter tuple
         backups = {}
-        for key, value in self._backup_cache.iteritems():
+        for key, value in self._backup_cache.items():
             if value.status in status_filter:
                 backups[key] = value
         return backups
@@ -140,7 +161,8 @@ class BackupManager(object):
             return available_backups.get(backup_id)
         return None
 
-    def get_previous_backup(self, backup_id, status_filter=DEFAULT_STATUS_FILTER):
+    def get_previous_backup(self, backup_id,
+                            status_filter=DEFAULT_STATUS_FILTER):
         """
         Get the previous backup (if any) in the catalog
 
@@ -187,13 +209,16 @@ class BackupManager(object):
                 current += 1
             return None
         except ValueError:
-            raise UnknownBackupIdException('Could not find backup_id %s' % backup_id)
+            raise UnknownBackupIdException('Could not find backup_id %s' %
+                                           backup_id)
 
-    def get_last_backup(self, status_filter=DEFAULT_STATUS_FILTER):
+    def get_last_backup_id(self, status_filter=DEFAULT_STATUS_FILTER):
         """
-        Get the last backup (if any) in the catalog
+        Get the id of the latest/last backup in the catalog (if exists)
 
-        :param status_filter: default DEFAULT_STATUS_FILTER. The status of the backup returned
+        :param status_filter: The status of the backup to return,
+            default to DEFAULT_STATUS_FILTER.
+        :return string|None: ID of the backup
         """
         available_backups = self.get_available_backups(status_filter)
         if len(available_backups) == 0:
@@ -202,11 +227,13 @@ class BackupManager(object):
         ids = sorted(available_backups.keys())
         return ids[-1]
 
-    def get_first_backup(self, status_filter=DEFAULT_STATUS_FILTER):
+    def get_first_backup_id(self, status_filter=DEFAULT_STATUS_FILTER):
         """
-        Get the first backup (if any) in the catalog
+        Get the id of the oldest/first backup in the catalog (if exists)
 
-        :param status_filter: default DEFAULT_STATUS_FILTER. The status of the backup returned
+        :param status_filter: The status of the backup to return,
+            default to DEFAULT_STATUS_FILTER.
+        :return string|None: ID of the backup
         """
         available_backups = self.get_available_backups(status_filter)
         if len(available_backups) == 0:
@@ -222,16 +249,18 @@ class BackupManager(object):
         :param backup: the backup to delete
         """
         available_backups = self.get_available_backups()
+        minimum_redundancy = self.server.config.minimum_redundancy
         # Honour minimum required redundancy
         if backup.status == BackupInfo.DONE and \
-                self.server.config.minimum_redundancy >= len(available_backups):
-            output.warning("Skipping delete of backup %s for server %s due to "
-                           "minimum redundancy requirements "
-                           "(minimum redundancy = %s, current redundancy = %s)",
+                minimum_redundancy >= len(available_backups):
+            output.warning("Skipping delete of backup %s for server %s "
+                           "due to minimum redundancy requirements "
+                           "(minimum redundancy = %s, "
+                           "current redundancy = %s)",
                            backup.backup_id,
                            self.config.name,
                            len(available_backups),
-                           self.server.config.minimum_redundancy)
+                           minimum_redundancy)
             return
 
         output.info("Deleting backup %s for server %s",
@@ -276,12 +305,13 @@ class BackupManager(object):
 
     def retry_backup_copy(self, target_function, *args, **kwargs):
         """
-        Execute the copy of a base backup, retrying a given number of times
+        Execute the target backup copy function, retrying the configured
+        number of times
 
-        :param target_function: the base backup copy function
-        :param args: args for the copy function
-        :param kwargs: kwargs of the copy function
-        :return: the result of the copy function
+        :param target_function: the base backup target function
+        :param args: args for the target function
+        :param kwargs: kwargs of the target function
+        :return: the result of the target function
         """
         attempts = 0
         while True:
@@ -289,11 +319,12 @@ class BackupManager(object):
                 # if is not the first attempt, output the retry number
                 if attempts >= 1:
                     output.warning("Copy of base backup: retry #%s", attempts)
+                # execute the target function for backup copy
                 return target_function(*args, **kwargs)
             # catch rsync errors
-            except DataTransferFailure, e:
-                # exit condition: if retry number is lower than configured retry
-                # limit, try again; otherwise exit.
+            except DataTransferFailure as e:
+                # exit condition: if retry number is lower than configured
+                # retry limit, try again; otherwise exit.
                 if attempts < self.config.basebackup_retry_times:
                     # Log the exception, for debugging purpose
                     _logger.exception("Failure in base backup copy: %s", e)
@@ -305,8 +336,8 @@ class BackupManager(object):
                     time.sleep(self.config.basebackup_retry_sleep)
                     attempts += 1
                 else:
-                    # if the max number of attempts is reached an there is still
-                    # an error, exit re-raising the exception.
+                    # if the max number of attempts is reached and
+                    # there is still an error, exit re-raising the exception.
                     raise
 
     def backup(self):
@@ -333,6 +364,12 @@ class BackupManager(object):
             script.env_from_backup_info(backup_info)
             script.run()
 
+            # Run the pre-backup-retry-script if present.
+            retry_script = RetryHookScriptRunner(
+                self, 'backup_retry_script', 'pre')
+            retry_script.env_from_backup_info(backup_info)
+            retry_script.run()
+
             # Do the backup using the BackupExecutor
             self.executor.backup(backup_info)
 
@@ -343,13 +380,14 @@ class BackupManager(object):
             backup_info.set_attribute("status", "DONE")
         # Use BaseException instead of Exception to catch events like
         # KeyboardInterrupt (e.g.: CRTL-C)
-        except BaseException, e:
+        except BaseException as e:
             msg_lines = str(e).strip().splitlines()
             if backup_info:
                 # Use only the first line of exception message
                 # in backup_info error field
                 backup_info.set_attribute("status", "FAILED")
-                # If the exception has no attached message use the raw type name
+                # If the exception has no attached message use the raw
+                # type name
                 if len(msg_lines) == 0:
                     msg_lines = [type(e).__name__]
                 backup_info.set_attribute(
@@ -367,9 +405,25 @@ class BackupManager(object):
                         backup_info.end_wal,
                         backup_info.end_offset)
             output.info("Backup completed")
+            # Create a restore point after a backup
+            target_name = 'barman_%s' % backup_info.backup_id
+            self.server.postgres.create_restore_point(target_name)
         finally:
             if backup_info:
                 backup_info.save()
+
+                # Run the post-backup-retry-script if present.
+                try:
+                    retry_script = RetryHookScriptRunner(
+                        self, 'backup_retry_script', 'post')
+                    retry_script.env_from_backup_info(backup_info)
+                    retry_script.run()
+                except AbortedRetryHookScript as e:
+                    # Ignore the ABORT_STOP as it is a post-hook operation
+                    _logger.warning("Ignoring stop request after receiving "
+                                    "abort (exit code %d) from post-backup "
+                                    "retry hook script: %s",
+                                    e.hook.exit_status, e.hook.script)
 
                 # Run the post-backup-script if present.
                 script = HookScriptRunner(self, 'backup_script', 'post')
@@ -386,20 +440,20 @@ class BackupManager(object):
 
         :param barman.infofile.BackupInfo backup_info: the backup to recover
         :param str dest: the destination directory
-        :param dict[str,str]|None tablespaces: a tablespace name -> location map
-            (for relocation)
+        :param dict[str,str]|None tablespaces: a tablespace name -> location
+            map (for relocation)
         :param str|None target_tli: the target timeline
         :param str|None target_time: the target time
         :param str|None target_xid: the target xid
         :param str|None target_name: the target name created previously with
-                            pg_create_restore_point() function call
+            pg_create_restore_point() function call
         :param bool exclusive: whether the recovery is exclusive or not
-        :param str|None remote_command: default None. The remote command to recover
-                               the base backup, in case of remote backup.
+        :param str|None remote_command: default None. The remote command
+            to recover the base backup, in case of remote backup.
         """
 
-        # Run the cron to be sure the wal catalog is up to date
-        self.server.cron(verbose=False)
+        # Archive every WAL files in the incoming directory of the server
+        self.server.archive_wal(verbose=False)
         # Delegate the recovery operation to a RecoveryExecutor object
         executor = RecoveryExecutor(self)
         recovery_info = executor.recover(backup_info,
@@ -412,71 +466,18 @@ class BackupManager(object):
         # Output recovery results
         output.result('recovery', recovery_info['results'])
 
-    def cron(self, verbose=True):
+    def archive_wal(self, verbose=True):
         """
-        Executes maintenance operations, such as WAL trashing.
+        Executes WAL maintenance operations, such as archiving and compression
 
         If verbose is set to False, outputs something only if there is
         at least one file
 
         :param bool verbose: report even if no actions
         """
-        found = False
-        compressor = self.compression_manager.get_compressor()
         with self.server.xlogdb('a') as fxlogdb:
-            if verbose:
-                output.info("Processing xlog segments for %s",
-                            self.config.name,
-                            log=False)
-            # Get the first available backup
-            first_backup_id = self.get_first_backup(BackupInfo.STATUS_NOT_EMPTY)
-            first_backup = self.server.get_backup(first_backup_id)
-            for filename in sorted(glob(
-                    os.path.join(self.config.incoming_wals_directory, '*'))):
-                if not found and not verbose:
-                    output.info("Processing xlog segments for %s",
-                                self.config.name,
-                                log=False)
-                found = True
-
-                # Create WAL Info object
-                wal_info = WalFileInfo.from_file(filename, compression=None)
-
-                # If there are no available backups ...
-                if first_backup is None:
-                    # ... delete xlog segments only for exclusive backups
-                    if BackupOptions.CONCURRENT_BACKUP not in self.config.backup_options:
-                        output.info("\tNo base backup available. Trashing file %s"
-                                " from server %s",
-                                wal_info.name, self.config.name)
-                        os.unlink(filename)
-                        continue
-                # ... otherwise
-                else:
-                    # ... delete xlog segments older than the first backup
-                    if wal_info.name < first_backup.begin_wal:
-                        output.info("\tOlder than first backup. Trashing file %s"
-                                " from server %s",
-                                wal_info.name, self.config.name)
-                        os.unlink(filename)
-                        continue
-
-                # Report to the user the WAL file we are archiving
-                output.info("\t%s", os.path.basename(filename), log=False)
-                _logger.info("Archiving %s/%s",
-                             self.config.name,
-                             os.path.basename(filename))
-                # Archive the WAL file
-                self.cron_wal_archival(compressor, wal_info)
-
-                # Updates the information of the WAL archive with
-                # the latest segments
-                fxlogdb.write(wal_info.to_xlogdb_line())
-                # flush and fsync for every line
-                fxlogdb.flush()
-                os.fsync(fxlogdb.fileno())
-        if not found and verbose:
-            output.info("\tno file found", log=False)
+            for archiver in self.server.archivers:
+                archiver.archive(fxlogdb, verbose)
 
     def cron_retention_policy(self):
         """
@@ -487,7 +488,7 @@ class BackupManager(object):
             available_backups = self.get_available_backups(
                 BackupInfo.STATUS_ALL)
             retention_status = self.config.retention_policy.report()
-            for bid in sorted(retention_status.iterkeys()):
+            for bid in sorted(retention_status.keys()):
                 if retention_status[bid] == BackupInfo.OBSOLETE:
                     output.info(
                         "Enforcing retention policy: removing backup %s for "
@@ -514,12 +515,14 @@ class BackupManager(object):
             if backup.backup_version == 2:
                 tbs_dir = backup.get_basebackup_directory()
             else:
-                tbs_dir = os.path.join(backup.get_data_directory(), 'pg_tblspc')
+                tbs_dir = os.path.join(backup.get_data_directory(),
+                                       'pg_tblspc')
             for tablespace in backup.tablespaces:
                 rm_dir = os.path.join(tbs_dir, str(tablespace.oid))
-                _logger.debug("Deleting tablespace %s directory: %s" %
-                              (tablespace.name, rm_dir))
-                shutil.rmtree(rm_dir)
+                if os.path.exists(rm_dir):
+                    _logger.debug("Deleting tablespace %s directory: %s" %
+                                  (tablespace.name, rm_dir))
+                    shutil.rmtree(rm_dir)
 
         pg_data = backup.get_data_directory()
         if os.path.exists(pg_data):
@@ -546,82 +549,56 @@ class BackupManager(object):
             _logger.warning('Expected WAL file %s not found during delete',
                             wal_info.name, exc_info=1)
 
-    def cron_wal_archival(self, compressor, wal_info):
+    def check(self, check_strategy):
         """
-        Archive a WAL segment from the incoming directory.
-        This function returns a WalFileInfo object.
+        This function does some checks on the server.
 
-        :param compressor: the compressor for the file (if any)
-        :param wal_info: WalFileInfo of the WAL file is being processed
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
         """
-        destfile = wal_info.fullpath(self.server)
-        destdir = os.path.dirname(destfile)
-        srcfile = os.path.join(self.config.incoming_wals_directory,
-                wal_info.name)
-
-        # Run the pre_archive_script if present.
-        script = HookScriptRunner(self, 'archive_script', 'pre')
-        script.env_from_wal_info(wal_info, srcfile)
-        script.run()
-
-        mkpath(destdir)
-        if compressor:
-            compressor.compress(srcfile, destfile)
-            shutil.copystat(srcfile, destfile)
-            os.unlink(srcfile)
-        else:
-            shutil.move(srcfile, destfile)
-
-        # execute fsync() on the archived WAL containing directory
-        fsync_dir(destdir)
-        # execute fsync() also on the incoming directory
-        fsync_dir(self.config.incoming_wals_directory)
-        # execute fsync() on the archived WAL file
-        file_fd = os.open(destfile, os.O_RDONLY)
-        os.fsync(file_fd)
-        os.close(file_fd)
-
-        stat = os.stat(destfile)
-        wal_info.size = stat.st_size
-        wal_info.compression = compressor and compressor.compression
-
-        # Run the post_archive_script if present.
-        script = HookScriptRunner(self, 'archive_script', 'post')
-        script.env_from_wal_info(wal_info)
-        script.run()
-
-    def check(self):
-        """
-        This function performs some checks on the server.
-        Set error code to 1 if any of the checks fails
-        """
+        # Check compression_setting parameter
         if self.config.compression and not self.compression_manager.check():
-            output.result('check', self.config.name,
-                          'compression settings', False)
+            check_strategy.result(self.config.name,
+                                  'compression settings', False)
         else:
             status = True
             try:
                 self.compression_manager.get_compressor()
-            except CompressionIncompatibility, field:
-                output.result('check', self.config.name,
-                              '%s setting' % field, False)
+            except CompressionIncompatibility as field:
+                check_strategy.result(self.config.name,
+                                      '%s setting' % field, False)
                 status = False
-            output.result('check', self.config.name,
-                          'compression settings', status)
+            check_strategy.result(self.config.name,
+                                  'compression settings', status)
+
+        # Failed backups check
+        failed_backups = self.get_available_backups((BackupInfo.FAILED,))
+        status = len(failed_backups) == 0
+        check_strategy.result(
+            self.config.name,
+            'failed backups',
+            status,
+            'there are %s failed backups' % (len(failed_backups,))
+        )
 
         # Minimum redundancy checks
         no_backups = len(self.get_available_backups())
-        if no_backups < self.config.minimum_redundancy:
+        # Check minimum_redundancy_requirements parameter
+        if no_backups < int(self.config.minimum_redundancy):
             status = False
         else:
             status = True
-        output.result('check', self.config.name,
-                      'minimum redundancy requirements', status,
-                      'have %s backups, expected at least %s' %
-                      (no_backups, self.config.minimum_redundancy))
+        check_strategy.result(
+            self.config.name,
+            'minimum redundancy requirements', status,
+            'have %s backups, expected at least %s' % (
+                no_backups, self.config.minimum_redundancy))
+
+        # TODO: Add a check for the existence of ssh and of rsync
 
         # Execute additional checks defined by the BackupExecutor
-        self.executor.check()
+        if self.executor:
+            self.executor.check(check_strategy)
 
     def status(self):
         """
@@ -635,11 +612,11 @@ class BackupManager(object):
         output.result('status', self.config.name,
                       "first_backup",
                       "First available backup",
-                      self.get_first_backup())
+                      self.get_first_backup_id())
         output.result('status', self.config.name,
                       "last_backup",
                       "Last available backup",
-                      self.get_last_backup())
+                      self.get_last_backup_id())
         # Minimum redundancy check. if number of backups minor than minimum
         # redundancy, fail.
         if no_backups < self.config.minimum_redundancy:
@@ -658,15 +635,22 @@ class BackupManager(object):
                               self.config.minimum_redundancy))
 
         # Output additional status defined by the BackupExecutor
-        self.executor.status()
+        if self.executor:
+            self.executor.status()
 
-    def get_remote_status(self):
+    def fetch_remote_status(self):
         """
         Build additional remote status lines defined by the BackupManager.
 
-        :rtype: dict[str, None]
+        This method does not raise any exception in case of errors,
+        but set the missing values to None in the resulting dictionary.
+
+        :rtype: dict[str, None|str]
         """
-        return self.executor.get_remote_status()
+        if self.executor:
+            return self.executor.get_remote_status()
+        else:
+            return {}
 
     def rebuild_xlogdb(self):
         """
@@ -748,11 +732,21 @@ class BackupManager(object):
             with open(xlogdb_new, 'w') as fxlogdb_new:
                 for line in fxlogdb:
                     wal_info = WalFileInfo.from_xlogdb_line(line)
-                    if backup_info and wal_info.name >= backup_info.begin_wal:
+                    if not xlog.is_any_xlog_file(wal_info.name):
+                        output.error(
+                            "invalid xlog segment name %r\n"
+                            "HINT: Please run \"barman rebuild-xlogdb %s\" "
+                            "to solve this issue",
+                            wal_info.name, self.config.name)
+                        continue
+                    # Keeps the WAL segment if it is a history file or later
+                    # than the given backup (the first available)
+                    if (xlog.is_history_file(wal_info.name) or
+                            (backup_info and
+                                wal_info.name >= backup_info.begin_wal)):
                         fxlogdb_new.write(wal_info.to_xlogdb_line())
                         continue
                     else:
-                        # Delete the WAL segment
                         self.delete_wal(wal_info)
                         removed.append(wal_info.name)
                 fxlogdb_new.flush()
@@ -769,13 +763,13 @@ class BackupManager(object):
         the function returns True.
 
         :param timedate.timedelta last_backup_maximum_age: time interval
-            representing the maximum allowed age for the last backup in a server
-            catalogue
+            representing the maximum allowed age for the last backup
+            in a server catalogue
         :return tuple: a tuple containing the boolean result of the check and
             auxiliary information about the last backup current age
         """
         # Get the ID of the last available backup
-        backup_id = self.get_last_backup()
+        backup_id = self.get_last_backup_id()
         if backup_id:
             # Get the backup object
             backup = BackupInfo(self.server, backup_id=backup_id)
@@ -796,7 +790,8 @@ class BackupManager(object):
 
     def backup_fsync_and_set_sizes(self, backup_info):
         """
-        Fsync all files in a backup and set the actual size on disk of a backup.
+        Fsync all files in a backup and set the actual size on disk
+        of a backup.
 
         Also evaluate the deduplication ratio and the deduplicated size if
         applicable.
@@ -808,7 +803,7 @@ class BackupManager(object):
         _logger.debug(self.executor.current_action)
         backup_size = 0
         deduplicated_size = 0
-        backup_dest = backup_info.get_data_directory()
+        backup_dest = backup_info.get_basebackup_directory()
         for dir_path, _, file_names in os.walk(backup_dest):
             # execute fsync() on the containing directory
             fsync_dir(dir_path)
@@ -836,9 +831,9 @@ class BackupManager(object):
             output.info(
                 "Backup size: %s. Actual size on disk: %s"
                 " (-%s deduplication ratio)." % (
-                pretty_size(backup_info.size),
-                pretty_size(backup_info.deduplicated_size),
-                '{percent:.2%}'.format(percent=deduplication_ratio)
+                    pretty_size(backup_info.size),
+                    pretty_size(backup_info.deduplicated_size),
+                    '{percent:.2%}'.format(percent=deduplication_ratio)
                 ))
         else:
             output.info("Backup size: %s" %

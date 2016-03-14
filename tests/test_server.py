@@ -1,4 +1,4 @@
-# Copyright (C) 2013-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2013-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -15,17 +15,21 @@
 # You should have received a copy of the GNU General Public License
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
-from collections import defaultdict
 import datetime
 import os
+from collections import defaultdict
 
-from mock import patch, MagicMock
 import pytest
+from mock import MagicMock, patch
 
-from barman.infofile import WalFileInfo
-from barman.server import Server, PostgresConnectionError
-from testing_helpers import build_test_backup_info, build_config_from_dicts, \
-    build_real_server
+from barman.infofile import BackupInfo, WalFileInfo
+from barman.lockfile import (LockFileBusy, LockFilePermissionDenied,
+                             ServerBackupLock, ServerCronLock,
+                             ServerWalArchiveLock, ServerWalReceiveLock)
+from barman.process import ProcessInfo
+from barman.server import CheckOutputStrategy, CheckStrategy, Server
+from testing_helpers import (build_config_from_dicts, build_real_server,
+                             build_test_backup_info)
 
 
 class ExceptionTest(Exception):
@@ -42,7 +46,34 @@ class TestServer(object):
         """
         Basic initialization test with minimal parameters
         """
-        Server(build_config_from_dicts().get_server('main'))
+        server = Server(build_config_from_dicts().get_server('main'))
+        assert not server.config.disabled
+
+    def test_bad_init(self):
+        """
+        Check the server is buildable with an empty configuration
+        """
+        server = Server(build_config_from_dicts(
+            main_conf={
+                'conninfo': '',
+                'ssh_command': '',
+            }
+        ).get_server('main'))
+        assert server.config.disabled
+
+    def test_check_config_missing(self):
+        """
+        Verify the check method can be called on an empty configuration
+        """
+        server = Server(build_config_from_dicts(
+            main_conf={
+                'conninfo': '',
+                'ssh_command': '',
+            }
+        ).get_server('main'))
+        check_strategy = CheckOutputStrategy()
+        server.check(check_strategy)
+        assert check_strategy.has_error
 
     @patch('barman.server.os')
     def test_xlogdb_with_exception(self, os_mock, tmpdir):
@@ -245,19 +276,6 @@ class TestServer(object):
             stats['last_failed_time'].ctime()
         )
 
-    def test_pg_connect_error(self):
-        """
-        Check pg_connect method beaviour on error
-        """
-        # Setup temp dir and server
-        server = build_real_server()
-        # Set an invalid conninfo parameter.
-        server.config.conninfo = "not valid conninfo"
-        # expect pg_connect to raise a PostgresConnectionError
-        with pytest.raises(PostgresConnectionError):
-            with server.pg_connect():
-                assert False  # should never get here
-
     @patch('barman.server.Server.get_remote_status')
     def test_check_postgres(self, postgres_mock, capsys):
         """
@@ -271,7 +289,8 @@ class TestServer(object):
         server = build_real_server()
         # Case: no reply by PostgreSQL
         # Expect out: PostgreSQL: FAILED
-        server.check_postgres()
+        strategy = CheckOutputStrategy()
+        server.check_postgres(strategy)
         (out, err) = capsys.readouterr()
         assert out == '	PostgreSQL: FAILED\n'
         # Case: correct configuration
@@ -282,14 +301,23 @@ class TestServer(object):
                                       'data_directory': '/usr/local/postgres',
                                       'archive_mode': 'on',
                                       'wal_level': 'archive'}
-        # Do check
+
         # Expect out: all parameters: OK
-        server.check_postgres()
+
+        # Postgres version >= 9.0 - check wal_level
+        server = build_real_server()
+        server.check_postgres(strategy)
         (out, err) = capsys.readouterr()
         assert out == "\tPostgreSQL: OK\n" \
-                      "\tarchive_mode: OK\n" \
-                      "\twal_level: OK\n" \
-                      "\tarchive_command: OK\n"
+                      "\twal_level: OK\n"
+
+        # Postgres version < 9.0 - avoid wal_level check
+        del postgres_mock.return_value['wal_level']
+
+        server = build_real_server()
+        server.check_postgres(strategy)
+        (out, err) = capsys.readouterr()
+        assert out == "\tPostgreSQL: OK\n"
 
         # Case: wal_level and archive_command values are not acceptable
         postgres_mock.return_value = {'current_xlog': None,
@@ -299,16 +327,13 @@ class TestServer(object):
                                       'data_directory': '/usr/local/postgres',
                                       'archive_mode': 'on',
                                       'wal_level': 'minimal'}
-        # Do check
         # Expect out: some parameters: FAILED
-        server.check_postgres()
+        strategy = CheckOutputStrategy()
+        server.check_postgres(strategy)
         (out, err) = capsys.readouterr()
         assert out == "\tPostgreSQL: OK\n" \
-                      "\tarchive_mode: OK\n" \
                       "\twal_level: FAILED (please set it to a higher level " \
-                      "than 'minimal')\n" \
-                      "\tarchive_command: FAILED (please set it " \
-                      "accordingly to documentation)\n"
+                      "than 'minimal')\n"
 
     @patch('barman.server.Server.get_wal_until_next_backup')
     def test_get_wal_info(self, get_wal_mock, tmpdir):
@@ -346,3 +371,351 @@ class TestServer(object):
         assert wal_info
         assert wal_info['wal_total_seconds'] == wal_total_seconds
         assert wal_info['wals_per_second'] == wals_per_second
+
+    @patch('barman.server.Server.check')
+    @patch('barman.server.Server._make_directories')
+    @patch('barman.backup.BackupManager.backup')
+    @patch('barman.server.Server.archive_wal')
+    @patch('barman.server.ServerBackupLock')
+    def test_backup(self, backup_lock_mock, archive_wal_mock,
+                    backup_manager_mock, dir_mock, check_mock, capsys):
+        """
+
+        :param backup_lock_mock: mock ServerBackupLock
+        :param archive_wal_mock: mock archive_wal server method
+        :param backup_manager_mock: mock BackupManager.backup
+        :param dir_mock: mock _make_directories
+        :param check_mock: mock check
+        """
+
+        # Create server
+        server = build_real_server()
+        dir_mock.side_effect = OSError()
+        server.backup()
+        out, err = capsys.readouterr()
+        assert 'failed to create' in err
+
+        dir_mock.side_effect = None
+        server.backup()
+        backup_manager_mock.assert_called_once_with()
+        archive_wal_mock.assert_called_once_with(verbose=False)
+
+        backup_manager_mock.side_effect = LockFileBusy()
+        server.backup()
+        out, err = capsys.readouterr()
+        assert 'Another backup process is running' in err
+
+        backup_manager_mock.side_effect = LockFilePermissionDenied()
+        server.backup()
+        out, err = capsys.readouterr()
+        assert 'Permission denied, unable to access' in err
+
+    @patch('barman.server.Server.get_first_backup_id')
+    @patch('barman.server.BackupManager.delete_backup')
+    def test_delete_running_backup(self, delete_mock, get_first_backup_mock,
+                                   tmpdir, capsys):
+        """
+        Simple test for the deletion of a running backup.
+        We want to test the behaviour of the server.delete_backup method
+        when invoked on a running backup
+        """
+        # Test the removal of a running backup. status STARTED
+        server = build_real_server({'barman_home': tmpdir.strpath})
+        backup_info_started = build_test_backup_info(
+            status=BackupInfo.STARTED,
+            server_name=server.config.name)
+        get_first_backup_mock.return_value = backup_info_started.backup_id
+        with ServerBackupLock(tmpdir.strpath, server.config.name):
+            server.delete_backup(backup_info_started)
+            out, err = capsys.readouterr()
+            assert "Cannot delete a running backup (%s %s)" % (
+                server.config.name,
+                backup_info_started.backup_id) in err
+
+        # Test the removal of a running backup. status EMPTY
+        backup_info_empty = build_test_backup_info(
+            status=BackupInfo.EMPTY,
+            server_name=server.config.name)
+        get_first_backup_mock.return_value = backup_info_empty.backup_id
+        with ServerBackupLock(tmpdir.strpath, server.config.name):
+            server.delete_backup(backup_info_empty)
+            out, err = capsys.readouterr()
+            assert "Cannot delete a running backup (%s %s)" % (
+                server.config.name,
+                backup_info_started.backup_id) in err
+
+        # Test the removal of a running backup. status DONE
+        backup_info_done = build_test_backup_info(
+            status=BackupInfo.DONE,
+            server_name=server.config.name)
+        with ServerBackupLock(tmpdir.strpath, server.config.name):
+            server.delete_backup(backup_info_done)
+            delete_mock.assert_called_with(backup_info_done)
+
+        # Test the removal of a backup not running. status STARTED
+        server.delete_backup(backup_info_started)
+        delete_mock.assert_called_with(backup_info_started)
+
+    @patch("subprocess.Popen")
+    def test_archive_wal_lock_acquisition(self, subprocess_mock,
+                                          tmpdir, capsys):
+        """
+        Basic test for archive-wal lock acquisition
+        """
+        server = build_real_server({'barman_home': tmpdir.strpath})
+
+        with ServerWalArchiveLock(tmpdir.strpath, server.config.name):
+            server.archive_wal()
+            out, err = capsys.readouterr()
+            assert ("Another archive-wal process is already running "
+                    "on server %s. Skipping to the next server"
+                    % server.config.name) in out
+
+    @patch("subprocess.Popen")
+    def test_cron_lock_acquisition(self, subprocess_mock,
+                                   tmpdir, capsys, caplog):
+        """
+        Basic test for cron process lock acquisition
+        """
+        server = build_real_server({'barman_home': tmpdir.strpath})
+
+        # Basic cron lock acquisition
+        with ServerCronLock(tmpdir.strpath, server.config.name):
+            server.cron(wals=True, retention_policies=False)
+            out, err = capsys.readouterr()
+            assert ("Another cron process is already running on server %s. "
+                    "Skipping to the next server\n" %
+                    server.config.name) in out
+
+        # Lock acquisition for archive-wal
+        with ServerWalArchiveLock(tmpdir.strpath, server.config.name):
+            server.cron(wals=True, retention_policies=False)
+            out, err = capsys.readouterr()
+            assert ("Another archive-wal process is already running "
+                    "on server %s. Skipping to the next server"
+                    % server.config.name) in out
+        # Lock acquisition for receive-wal
+        with ServerWalArchiveLock(tmpdir.strpath, server.config.name):
+            with ServerWalReceiveLock(tmpdir.strpath, server.config.name):
+                # force the streaming_archiver to True for this test
+                server.config.streaming_archiver = True
+                server.cron(wals=True, retention_policies=False)
+                assert ("Another STREAMING ARCHIVER process is running for "
+                        "server %s" % server.config.name) in caplog.text
+
+    @patch('barman.server.ProcessManager')
+    def test_kill(self, pm_mock, capsys):
+
+        server = build_real_server()
+
+        # Empty process list, the process is not running
+        task_name = 'test_task'
+        process_list = []
+        pm_mock.return_value.list.return_value = process_list
+        pm_mock.return_value.kill.return_value = True
+        server.kill(task_name)
+        out, err = capsys.readouterr()
+        assert ('Termination of %s failed: no such process for server %s' % (
+            task_name,
+            server.config.name)) in err
+
+        # Successful kill
+        pid = 1234
+        process_list.append(ProcessInfo(pid, server.config.name, task_name))
+        pm_mock.return_value.list.return_value = process_list
+        pm_mock.return_value.kill.return_value = True
+        server.kill('test_task')
+        out, err = capsys.readouterr()
+        assert ('Stopped process %s(%s)' %
+                (task_name, pid)) in out
+
+        # The process don't terminate
+        pm_mock.return_value.kill.return_value = False
+        server.kill('test_task')
+        out, err = capsys.readouterr()
+        assert ('ERROR: Cannot terminate process %s(%s)' %
+                (task_name, pid)) in err
+
+    @patch('os.listdir')
+    @patch('os.path.isdir')
+    def test_check_archiver_errors(self, isdir_mock, listdir_mock):
+        server = build_real_server()
+        check_strategy = MagicMock()
+
+        # There is no error file
+        check_strategy.reset_mock()
+        listdir_mock.return_value = []
+        server.check_archiver_errors(check_strategy)
+        check_strategy.result.assert_called_with(
+            'main',
+            'archiver errors',
+            True,
+            None,
+        )
+
+        # There is one duplicate file
+        check_strategy.reset_mock()
+        listdir_mock.return_value = ['testing.duplicate']
+        server.check_archiver_errors(check_strategy)
+        check_strategy.result.assert_called_with(
+            'main',
+            'archiver errors',
+            False,
+            'duplicates: 1',
+        )
+
+        # There is one unknown file
+        check_strategy.reset_mock()
+        listdir_mock.return_value = ['testing.unknown']
+        server.check_archiver_errors(check_strategy)
+        check_strategy.result.assert_called_with(
+            'main',
+            'archiver errors',
+            False,
+            'unknown: 1',
+        )
+
+        # There is one not relevant file
+        check_strategy.reset_mock()
+        listdir_mock.return_value = ['testing.error']
+        server.check_archiver_errors(check_strategy)
+        check_strategy.result.assert_called_with(
+            'main',
+            'archiver errors',
+            False,
+            'not relevant: 1',
+        )
+
+        # There is one extraneous file
+        check_strategy.reset_mock()
+        listdir_mock.return_value = ['testing.wrongextension']
+        server.check_archiver_errors(check_strategy)
+        check_strategy.result.assert_called_with(
+            'main',
+            'archiver errors',
+            False,
+            'unknown failure: 1'
+        )
+
+
+class TestCheckStrategy(object):
+    """
+    Test the different strategies for the results of the check command
+    """
+
+    def test_check_output_strategy(self, capsys):
+        """
+        Test correct output result
+        """
+        strategy = CheckOutputStrategy()
+        # Expected result OK
+        strategy.result('test_server_one', 'wal_level', True)
+        out, err = capsys.readouterr()
+        assert out == '	wal_level: OK\n'
+        # Expected result FAILED
+        strategy.result('test_server_one', 'wal_level', False)
+        out, err = capsys.readouterr()
+        assert out == '	wal_level: FAILED\n'
+
+    def test_check_output_strategy_log(self, caplog):
+        """
+        Test correct output log
+
+        :type caplog: pytest_capturelog.CaptureLogFuncArg
+        """
+        strategy = CheckOutputStrategy()
+        # Expected result OK
+        strategy.result('test_server_one', 'wal_level', True)
+        records = list(caplog.records)
+        assert len(records) == 1
+        record = records.pop()
+        assert record.msg == \
+            "Check 'wal_level' succeeded for server 'test_server_one'"
+        assert record.levelname == 'DEBUG'
+        # Expected result FAILED
+        strategy = CheckOutputStrategy()
+        strategy.result('test_server_one', 'wal_level', False)
+        strategy.result('test_server_one', 'backup maximum age', False)
+        records = list(caplog.records)
+        assert len(records) == 3
+        record = records.pop()
+        assert record.levelname == 'ERROR'
+        assert record.msg == \
+            "Check 'backup maximum age' failed for server 'test_server_one'"
+        record = records.pop()
+        assert record.levelname == 'ERROR'
+        assert record.msg == \
+            "Check 'wal_level' failed for server 'test_server_one'"
+
+    def test_check_strategy(self, capsys):
+        """
+        Test correct values result
+
+        :type capsys: pytest
+        """
+        strategy = CheckStrategy()
+        # Expected no errors
+        strategy.result('test_server_one', 'wal_level', True)
+        strategy.result('test_server_one', 'archive mode', True)
+        assert ('', '') == capsys.readouterr()
+        assert strategy.has_error is False
+        assert strategy.check_result
+        assert len(strategy.check_result) == 2
+        # Expected two errors
+        strategy = CheckStrategy()
+        strategy.result('test_server_one', 'wal_level', False)
+        strategy.result('test_server_one', 'archive mode', False)
+        assert ('', '') == capsys.readouterr()
+        assert strategy.has_error is True
+        assert strategy.check_result
+        assert len(strategy.check_result) == 2
+        assert len([result
+                    for result in strategy.check_result
+                    if not result.status]) == 2
+        # Test Non blocking error behaviour (one non blocking error)
+        strategy = CheckStrategy()
+        strategy.result('test_server_one', 'backup maximum age', False)
+        strategy.result('test_server_one', 'archive mode', True)
+        assert ('', '') == capsys.readouterr()
+        assert strategy.has_error is False
+        assert strategy.check_result
+        assert len(strategy.check_result) == 2
+        assert len([result
+                    for result in strategy.check_result
+                    if not result.status]) == 1
+
+        # Test Non blocking error behaviour (2 errors one is non blocking)
+        strategy = CheckStrategy()
+        strategy.result('test_server_one', 'backup maximum age', False)
+        strategy.result('test_server_one', 'archive mode', False)
+        assert ('', '') == capsys.readouterr()
+        assert strategy.has_error is True
+        assert strategy.check_result
+        assert len(strategy.check_result) == 2
+        assert len([result
+                    for result in strategy.check_result
+                    if not result.status]) == 2
+
+    def test_check_strategy_log(self, caplog):
+        """
+        Test correct log
+
+        :type caplog: pytest_capturelog.CaptureLogFuncArg
+        """
+        strategy = CheckStrategy()
+        # Expected result OK
+        strategy.result('test_server_one', 'wal_level', True)
+        records = list(caplog.records)
+        assert len(records) == 1
+        record = records.pop()
+        assert record.msg == \
+            "Check 'wal_level' succeeded for server 'test_server_one'"
+        assert record.levelname == 'DEBUG'
+        # Expected result FAILED
+        strategy.result('test_server_one', 'wal_level', False)
+        records = list(caplog.records)
+        assert len(records) == 2
+        record = records.pop()
+        assert record.levelname == 'ERROR'
+        assert record.msg == \
+            "Check 'wal_level' failed for server 'test_server_one'"

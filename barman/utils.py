@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2011-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -20,6 +20,7 @@ This module contains utility functions used in Barman.
 """
 
 import datetime
+import decimal
 import errno
 import grp
 import json
@@ -27,7 +28,6 @@ import logging
 import logging.handlers
 import os
 import pwd
-
 
 _logger = logging.getLogger(__name__)
 
@@ -50,8 +50,6 @@ def drop_privileges(user):
     os.setgroups(groups)
     os.setgid(pw.pw_gid)
     os.setuid(pw.pw_uid)
-    os.setegid(pw.pw_gid)
-    os.seteuid(pw.pw_uid)
     os.environ['HOME'] = pw.pw_dir
 
 
@@ -103,7 +101,8 @@ def configure_logging(
 
 def parse_log_level(log_level):
     """
-    Convert a log level to its int representation as required by logging module.
+    Convert a log level to its int representation as required by
+    logging module.
 
     :param log_level: An integer or a string
     :return: an integer or None if an invalid argument is provided
@@ -121,9 +120,9 @@ def pretty_size(size, unit=1024):
     """
     This function returns a pretty representation of a size value
 
-    :param int,long,float size: the number to to prettify
+    :param int|long|float size: the number to to prettify
     :param int unit: 1000 or 1024 (the default)
-    :rtype : str
+    :rtype: str
     """
     suffixes = ["B"] + [i + {1000: "B", 1024: "iB"}[unit] for i in "KMGTPEZY"]
     if unit == 1000:
@@ -184,22 +183,33 @@ def human_readable_timedelta(timedelta):
     return human
 
 
-def which(executable):
+def which(executable, path=None):
     """
     This method is useful to find if a executable is present into the
     os PATH
 
     :param str executable: The name of the executable to find
+    :param str|None path: An optional search path to override the current one.
     :return str|None: the path of the executable or None
     """
     # Get the system path and split.
-    path = os.getenv('PATH')
+    if path is None:
+        path = os.getenv('PATH')
+    # If executable is an absolute path, check if it exists and is executable
+    # otherwise return failure.
+    if os.path.isabs(executable):
+        if os.path.exists(executable) and os.access(executable, os.X_OK):
+            return executable
+        else:
+            return None
+    # Search the requested executable in eery directory present in path and
+    # return the first occurrence that exists and is executable.
     for file_path in path.split(os.path.pathsep):
         file_path = os.path.join(file_path, executable)
-        # if the file exists return the full path.
+        # If the file exists and is executable return the full path.
         if os.path.exists(file_path) and os.access(file_path, os.X_OK):
             return file_path
-    # If the file is not present on the system return None
+    # If no matching file is present on the system return None
     return None
 
 
@@ -212,7 +222,6 @@ class BarmanEncoder(json.JSONEncoder):
     * dates and timestamps if they have a ctime() method.
     * objects that implement the 'to_json' method.
     * binary strings (python 3)
-
     """
     def default(self, obj):
         # If the object implements to_json() method use it
@@ -221,9 +230,14 @@ class BarmanEncoder(json.JSONEncoder):
         # Serialise date and datetime objects using ctime() method
         if hasattr(obj, 'ctime') and callable(obj.ctime):
             return obj.ctime()
-        # Serialise  timedelta objects using human_readable_timedelta()
+        # Serialise timedelta objects using human_readable_timedelta()
         if isinstance(obj, datetime.timedelta):
             return human_readable_timedelta(obj)
+        # Serialise Decimal objects using their string representation
+        # WARNING: When deserialized they will be treat as float values
+        # which have a lower precision
+        if isinstance(obj, decimal.Decimal):
+            return float(obj)
         # Binary strings must be decoded before using them in
         # an unicode string
         if hasattr(obj, 'decode') and callable(obj.decode):
@@ -242,9 +256,39 @@ def fsync_dir(dir_path):
     dir_fd = os.open(dir_path, os.O_DIRECTORY)
     try:
         os.fsync(dir_fd)
-    except OSError, e:
+    except OSError as e:
         # On some filesystem doing a fsync on a directory
         # raises an EINVAL error. Ignoring it is usually safe.
         if e.errno != errno.EINVAL:
             raise
     os.close(dir_fd)
+
+
+def simplify_version(version_string):
+    """
+    Simplify a version number using a major.minor format
+
+    :param version_string: the version number to simplify
+    :return str: the simplified version number
+    """
+    if version_string is None:
+        return None
+    version = version_string.split('.')
+    return '.'.join(version[:2])
+
+
+def with_metaclass(meta, *bases):
+    """
+    Function from jinja2/_compat.py. License: BSD.
+
+    Create a base class with a metaclass.
+
+    :param type meta: Metaclass to add to base class
+    """
+    # This requires a bit of explanation: the basic idea is to make a
+    # dummy metaclass for one level of class instantiation that replaces
+    # itself with the actual metaclass.
+    class Metaclass(type):
+        def __new__(mcs, name, this_bases, d):
+            return meta(name, bases, d)
+    return type.__new__(Metaclass, 'temporary_class', (), {})

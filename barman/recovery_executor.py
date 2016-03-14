@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2011-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -19,34 +19,37 @@
 This module contains the methods necessary to perform a recovery
 """
 
-from io import StringIO
+from __future__ import print_function
+
+import collections
 import logging
 import os
 import re
 import shutil
+import socket
 import tempfile
 import time
+from io import StringIO
 
-import collections
 import dateutil.parser
 import dateutil.tz
 
-from barman import xlog, output
-from barman.command_wrappers import DataTransferFailure, \
-    CommandFailedException, RsyncPgData, Rsync
-from barman.fs import FsOperationFailed, UnixRemoteCommand, UnixLocalCommand
+from barman import output, xlog
+from barman.command_wrappers import (CommandFailedException,
+                                     DataTransferFailure, Rsync, RsyncPgData)
+from barman.config import RecoveryOptions
+from barman.fs import FsOperationFailed, UnixLocalCommand, UnixRemoteCommand
 from barman.infofile import BackupInfo
 from barman.utils import mkpath
-
 
 # generic logger for this module
 _logger = logging.getLogger(__name__)
 
 # regexp matching a single value in Postgres configuration file
-PG_CONF_SETTING_RE = re.compile(r"^\s*([^\s=]+)\s*=\s*(.*)$")
+PG_CONF_SETTING_RE = re.compile(r"^\s*([^\s=]+)\s*=?\s*(.*)$")
 
-# create a namedtuple object called Assertion with 'filename', 'line', 'key' and
-# 'value' as properties
+# create a namedtuple object called Assertion
+# with 'filename', 'line', 'key' and 'value' as properties
 Assertion = collections.namedtuple('Assertion', 'filename line key value')
 
 
@@ -61,7 +64,8 @@ class RecoveryExecutor(object):
     DANGEROUS_OPTIONS = ['data_directory', 'config_file', 'hba_file',
                          'ident_file', 'external_pid_file', 'ssl_cert_file',
                          'ssl_key_file', 'ssl_ca_file', 'ssl_crl_file',
-                         'unix_socket_directory']
+                         'unix_socket_directory', 'include', 'include_dir',
+                         'include_if_exists']
 
     # List of options that, if present, need to be forced to a specific value
     # during recovery, to avoid data losses
@@ -122,7 +126,8 @@ class RecoveryExecutor(object):
         """
         This method looks for any possible issue with PostgreSQL
         location options such as data_directory, config_file, etc.
-        It returns a dictionary with the dangerous options that have been found.
+        It returns a dictionary with the dangerous options that
+        have been found.
 
         :param filename: the Postgres configuration file
         """
@@ -151,10 +156,11 @@ class RecoveryExecutor(object):
                                    remote_command):
         """
         Map configuration files, by filling the 'temporary_configuration_files'
-        array, depending on remote or local recovery. This array will be used by
-        the subsequent methods of the class.
+        array, depending on remote or local recovery. This array will be used
+        by the subsequent methods of the class.
 
-        :param dict recovery_info: Dictionary containing all the recovery params
+        :param dict recovery_info: Dictionary containing all the recovery
+            parameters
         :param barman.infofile.BackupInfo backup_info: a backup representation
         :param str remote_command: ssh command for remote recovery
         """
@@ -172,8 +178,8 @@ class RecoveryExecutor(object):
             # If is a remote recovery the conf files are inside a temporary dir
             else:
                 # Otherwise use the local destination path.
-                conf_file_path = os.path.join(recovery_info['destination_path'],
-                                              conf_file)
+                conf_file_path = os.path.join(
+                    recovery_info['destination_path'], conf_file)
             recovery_info['temporary_configuration_files'].append(
                 conf_file_path)
 
@@ -202,11 +208,13 @@ class RecoveryExecutor(object):
 
     def copy_temporary_config_files(self, dest, remote_command, recovery_info):
         """
-        Copy modified configuration files using rsync in case of remote recovery
+        Copy modified configuration files using rsync in case of
+        remote recovery
 
         :param str dest: destination directory of the recovery
         :param str remote_command: ssh command for remote connection
-        :param dict recovery_info: Dictionary containing all the recovery params
+        :param dict recovery_info: Dictionary containing all the recovery
+            parameters
         """
         if remote_command:
             # If this is a remote recovery, rsync the modified files from the
@@ -220,18 +228,19 @@ class RecoveryExecutor(object):
                 recovery_info['rsync'].from_file_list(file_list,
                                                       recovery_info['tempdir'],
                                                       ':%s' % dest)
-            except CommandFailedException, e:
+            except CommandFailedException as e:
                 output.exception(
                     'remote copy of configuration files failed: %s', e)
                 output.close_and_exit()
 
     def prepare_tablespaces(self, backup_info, cmd, dest, tablespaces):
         """
-        Prepare the directory structure for required tablespaces, taking care of
-        tablespaces relocation, if requested.
+        Prepare the directory structure for required tablespaces,
+        taking care of tablespaces relocation, if requested.
 
         :param barman.infofile.BackupInfo backup_info: backup representation
-        :param barman.fs.UnixLocalCommand cmd: Object for filesystem interaction
+        :param barman.fs.UnixLocalCommand cmd: Object for
+            filesystem interaction
         :param str dest: destination dir for the recovery
         :param dict tablespaces: dict of all the tablespaces and their location
         """
@@ -240,7 +249,7 @@ class RecoveryExecutor(object):
             # check for pg_tblspc dir into recovery destination folder.
             # if it does not exists, create it
             cmd.create_dir_if_not_exists(tblspc_dir)
-        except FsOperationFailed, e:
+        except FsOperationFailed as e:
             output.exception("unable to initialise tablespace directory "
                              "'%s': %s", tblspc_dir, e)
             output.close_and_exit()
@@ -269,7 +278,7 @@ class RecoveryExecutor(object):
                 cmd.check_write_permission(location)
                 # create symlink between tablespace and recovery folder
                 cmd.create_symbolic_link(location, pg_tblspc_file)
-            except FsOperationFailed, e:
+            except FsOperationFailed as e:
                 output.exception("unable to prepare '%s' tablespace "
                                  "(destination '%s'): %s",
                                  item.name, location, e)
@@ -285,7 +294,8 @@ class RecoveryExecutor(object):
         recovering now and the one previously recovered in the target
         directory). Set the value in the given recovery_info dictionary.
 
-        :param dict recovery_info: Dictionary containing all the recovery params
+        :param dict recovery_info: Dictionary containing all the recovery
+            parameters
         :param barman.infofile.BackupInfo backup_info: a backup representation
         :param str dest: recovery destination directory
         """
@@ -304,7 +314,7 @@ class RecoveryExecutor(object):
             safe_horizon = min(backup_begin_time, dest_begin_time)
             output.info("Using safe horizon time for smart rsync copy: %s",
                         safe_horizon)
-        except FsOperationFailed, e:
+        except FsOperationFailed as e:
             # Setting safe_horizon to None will effectively disable
             # the time-based part of smart_copy method. However it is still
             # faster than running all the transfers with checksum enabled.
@@ -314,7 +324,7 @@ class RecoveryExecutor(object):
             safe_horizon = None
             _logger.warning('Unable to retrieve safe horizon time '
                             'for smart rsync copy: %s', e)
-        except Exception, e:
+        except Exception as e:
             # Same as above, but something failed decoding .barman-recover.info
             # or comparing times, so log the full traceback
             safe_horizon = None
@@ -330,7 +340,8 @@ class RecoveryExecutor(object):
         Generate a recovery.conf file for PITR containing
         all the required configurations
 
-        :param dict recovery_info: Dictionary containing all the recovery params
+        :param dict recovery_info: Dictionary containing all the recovery
+            parameters
         :param barman.infofile.BackupInfo backup_info: representation of a
             backup
         :param str dest: destination directory of the recovery
@@ -346,24 +357,48 @@ class RecoveryExecutor(object):
                                          'recovery.conf'), 'w')
         else:
             recovery = open(os.path.join(dest, 'recovery.conf'), 'w')
-        print >> recovery, "restore_command = 'cp barman_xlog/%f %p'"
-        if backup_info.version >= 80400:
-            print >> recovery, "recovery_end_command = 'rm -fr barman_xlog'"
+
+        # If GET_WAL has been set, use the get-wal command to retrieve the
+        # required wal files. Otherwise use the unix command "cp" to copy
+        # them from the barman_xlog directory
+        if recovery_info['get_wal']:
+            # We need to guess the right way to execute the "barman"
+            # command on the Barman server.
+            # If remote recovery we use the machine FQDN and the barman_user
+            # setting to build an ssh command.
+            # If local recovery, we use barman directly, assuming
+            # the postgres process will be executed with the barman user.
+            # It has to be reviewed by the user in any case.
+            if remote_command:
+                fqdn = socket.getfqdn()
+                barman_command = 'ssh "%s@%s" barman' % (
+                    self.config.config.user, fqdn)
+            else:
+                barman_command = 'barman'
+            print("restore_command = '%s get-wal %s %%f > %%p'" % (
+                  barman_command, self.config.name), file=recovery)
+            recovery_info['results']['get_wal'] = True
+        else:
+            print("restore_command = 'cp barman_xlog/%f %p'", file=recovery)
+        if backup_info.version >= 80400 and \
+                not recovery_info['get_wal']:
+            print("recovery_end_command = 'rm -fr barman_xlog'", file=recovery)
         if target_time:
-            print >> recovery, "recovery_target_time = '%s'" % target_time
+            print("recovery_target_time = '%s'" % target_time, file=recovery)
         if target_tli:
-            print >> recovery, "recovery_target_timeline = %s" % target_tli
+            print("recovery_target_timeline = %s" % target_tli, file=recovery)
         if target_xid:
-            print >> recovery, "recovery_target_xid = '%s'" % target_xid
+            print("recovery_target_xid = '%s'" % target_xid, file=recovery)
         if target_name:
-            print >> recovery, "recovery_target_name = '%s'" % target_name
+            print("recovery_target_name = '%s'" % target_name, file=recovery)
         if (target_xid or target_time) and exclusive:
-            print >> recovery, "recovery_target_inclusive = '%s'" % (
-                not exclusive)
+            print("recovery_target_inclusive = '%s'" % (
+                not exclusive), file=recovery)
         recovery.close()
         if remote_command:
             # Uses plain rsync (without exclusions) to ship recovery.conf
             plain_rsync = Rsync(
+                path=self.server.path,
                 ssh=remote_command,
                 bwlimit=self.config.bandwidth_limit,
                 network_compression=self.config.network_compression)
@@ -371,7 +406,7 @@ class RecoveryExecutor(object):
                 plain_rsync.from_file_list(['recovery.conf'],
                                            recovery_info['tempdir'],
                                            ':%s' % dest)
-            except CommandFailedException, e:
+            except CommandFailedException as e:
                 output.exception(
                     'remote copy of recovery.conf failed: %s', e)
                 output.close_and_exit()
@@ -381,7 +416,8 @@ class RecoveryExecutor(object):
         """
         Populate the archive_status directory
 
-        :param dict recovery_info: Dictionary containing all the recovery params
+        :param dict recovery_info: Dictionary containing all the recovery
+            parameters
         :param str remote_command: ssh command for remote connection
         :param tuple required_xlog_files: list of required WAL segments
         """
@@ -427,13 +463,16 @@ class RecoveryExecutor(object):
             'temporary_configuration_files': [],
             'tempdir': tempfile.mkdtemp(prefix='barman_recovery-'),
             'is_pitr': False,
-            'wal_dest': os.path.join(dest, 'pg_xlog')}
+            'wal_dest': os.path.join(dest, 'pg_xlog'),
+            'get_wal': RecoveryOptions.GET_WAL in self.config.recovery_options,
+        }
         # A map that will keep track of the results of the recovery.
         # Used for output generation
         results = {
             'changes': [],
             'warnings': [],
-            'delete_barman_xlog': False
+            'delete_barman_xlog': False,
+            'get_wal': False,
         }
         recovery_info['results'] = results
 
@@ -446,6 +485,7 @@ class RecoveryExecutor(object):
         if remote_command:
             recovery_info['recovery_dest'] = 'remote'
             recovery_info['rsync'] = RsyncPgData(
+                path=self.server.path,
                 ssh=remote_command,
                 bwlimit=self.config.bandwidth_limit,
                 network_compression=self.config.network_compression)
@@ -478,7 +518,8 @@ class RecoveryExecutor(object):
         """
         Set PITR targets - as specified by the user
 
-        :param dict recovery_info: Dictionary containing all the recovery params
+        :param dict recovery_info: Dictionary containing all the recovery
+            parameters
         :param barman.infofile.BackupInfo backup_info: representation of a
             backup
         :param str dest: destination directory of the recovery
@@ -492,7 +533,8 @@ class RecoveryExecutor(object):
         if (target_time or
                 target_xid or
                 (target_tli and target_tli != backup_info.timeline) or
-                target_name):
+                target_name or
+                recovery_info['get_wal']):
             recovery_info['is_pitr'] = True
             targets = {}
             if target_time:
@@ -531,7 +573,8 @@ class RecoveryExecutor(object):
             # With a PostgreSQL version older than 8.4, it is the user's
             # responsibility to delete the "barman_xlog" directory as the
             # restore_command option in recovery.conf is not supported
-            if backup_info.version < 80400:
+            if backup_info.version < 80400 and \
+                    not recovery_info['get_wal']:
                 recovery_info['results']['delete_barman_xlog'] = True
         recovery_info['target_epoch'] = target_epoch
         recovery_info['target_datetime'] = target_datetime
@@ -544,8 +587,8 @@ class RecoveryExecutor(object):
 
         :param barman.infofile.BackupInfo backup_info: the backup to recover
         :param str dest: the destination directory
-        :param dict[str,str]|None tablespaces: a tablespace name -> location map
-            (for relocation)
+        :param dict[str,str]|None tablespaces: a tablespace
+            name -> location map (for relocation)
         :param str|None target_tli: the target timeline
         :param str|None target_time: the target time
         :param str|None target_xid: the target xid
@@ -578,7 +621,7 @@ class RecoveryExecutor(object):
         # check destination directory. If doesn't exist create it
         try:
             recovery_info['cmd'].create_dir_if_not_exists(dest)
-        except FsOperationFailed, e:
+        except FsOperationFailed as e:
             output.exception("unable to initialise destination directory "
                              "'%s': %s", dest, e)
             output.close_and_exit()
@@ -604,34 +647,53 @@ class RecoveryExecutor(object):
             output.exception("Failure copying base backup: %s", e)
             output.close_and_exit()
 
-        # Copy the backup.info file in the destination as ".barman-recover.info"
+        # Copy the backup.info file in the destination as
+        # ".barman-recover.info"
         if remote_command:
             try:
                 recovery_info['rsync'](backup_info.filename,
                                        ':%s/.barman-recover.info' % dest)
-            except CommandFailedException, e:
+            except CommandFailedException as e:
                 output.exception(
                     'copy of recovery metadata file failed: %s', e)
                 output.close_and_exit()
         else:
             backup_info.save(os.path.join(dest, '.barman-recover.info'))
 
-        # Prepare WAL segments local directory
-        output.info("Copying required WAL segments.")
+        # Restore the WAL segments. If GET_WAL option is set, skip this phase
+        # as they will be retrieved using the wal-get command.
+        if not recovery_info['get_wal']:
+            output.info("Copying required WAL segments.")
 
-        required_xlog_files = tuple(
-            self.server.get_required_xlog_files(backup_info,
-                                                target_tli,
-                                                recovery_info['target_epoch']))
+            try:
+                # Retrieve a list of required log files
+                required_xlog_files = tuple(
+                    self.server.get_required_xlog_files(
+                        backup_info, target_tli,
+                        recovery_info['target_epoch']))
 
-        # Restore WAL segments into the wal_dest directory
-        try:
-            self.xlog_copy(required_xlog_files,
-                           recovery_info['wal_dest'],
-                           remote_command)
-        except DataTransferFailure, e:
-            output.exception("Failure copying WAL files: %s", e)
-            output.close_and_exit()
+                # Restore WAL segments into the wal_dest directory
+                self.xlog_copy(required_xlog_files,
+                               recovery_info['wal_dest'],
+                               remote_command)
+            except DataTransferFailure as e:
+                output.exception("Failure copying WAL files: %s", e)
+                output.close_and_exit()
+            except xlog.BadXlogSegmentName as e:
+                output.error(
+                    "invalid xlog segment name %r\n"
+                    "HINT: Please run \"barman rebuild-xlogdb %s\" "
+                    "to solve this issue" %
+                    str(e), self.config.name)
+                output.close_and_exit()
+            # If WAL files are put directly in the pg_xlog directory,
+            # avoid shipping of just recovered files
+            # by creating the corresponding archive status file
+            if not recovery_info['is_pitr']:
+                output.info("Generating archive status files")
+                self.generate_archive_status(recovery_info,
+                                             remote_command,
+                                             required_xlog_files)
 
         # Generate recovery.conf file (only if needed by PITR)
         if recovery_info['is_pitr']:
@@ -639,11 +701,15 @@ class RecoveryExecutor(object):
             self.generate_recovery_conf(recovery_info, backup_info, dest,
                                         exclusive, remote_command, target_name,
                                         target_time, target_tli, target_xid)
-        else:
-            # avoid shipping of just recovered pg_xlog files
-            output.info("Generating archive status files")
-            self.generate_archive_status(recovery_info, remote_command,
-                                         required_xlog_files)
+
+        # Create archive_status directory if necessary
+        archive_status_dir = os.path.join(dest, 'pg_xlog', 'archive_status')
+        try:
+            recovery_info['cmd'].create_dir_if_not_exists(archive_status_dir)
+        except FsOperationFailed as e:
+            output.exception("unable to create the archive_status directory "
+                             "'%s': %s", archive_status_dir, e)
+            output.close_and_exit()
 
         # As last step, analyse configuration files in order to spot
         # harmful options. Barman performs automatic conversion of
@@ -675,8 +741,8 @@ class RecoveryExecutor(object):
 
         :param barman.infofile.BackupInfo backup_info: the backup to recover
         :param str dest: the destination directory
-        :param dict[str,str]|None tablespaces: a tablespace name -> location map
-            (for relocation)
+        :param dict[str,str]|None tablespaces: a tablespace
+            name -> location map (for relocation)
         :param str|None remote_command: default None. The remote command to
             recover the base backup, in case of remote backup.
         :param datetime.datetime|None safe_horizon: anything after this time
@@ -718,6 +784,7 @@ class RecoveryExecutor(object):
                 exclude_and_protect.append("/pg_tblspc/%s" % tablespace.oid)
                 # Copy the tablespace using smart copy
                 tb_rsync = RsyncPgData(
+                    path=self.server.path,
                     ssh=remote_command,
                     bwlimit=bwlimit,
                     network_compression=self.config.network_compression,
@@ -727,12 +794,13 @@ class RecoveryExecutor(object):
                         '%s/' % backup_info.get_data_directory(tablespace.oid),
                         dest_prefix + location,
                         safe_horizon)
-                except CommandFailedException, e:
+                except CommandFailedException as e:
                     msg = "data transfer failure on directory '%s'" % location
                     raise DataTransferFailure.from_rsync_error(e, msg)
 
         # Copy the pgdata directory
         rsync = RsyncPgData(
+            path=self.server.path,
             ssh=remote_command,
             bwlimit=self.config.bandwidth_limit,
             exclude_and_protect=exclude_and_protect,
@@ -760,31 +828,51 @@ class RecoveryExecutor(object):
         :param remote_command: default None. The remote command to recover
                the xlog, in case of remote backup.
         """
-        # Retrieve the list of required WAL segments
-        # according to recovery options
-        xlogs = {}
+        # List of required WAL files partitioned by containing directory
+        xlogs = collections.defaultdict(list)
+        # add '/' suffix to ensure it is a directory
+        wal_dest = '%s/' % wal_dest
+        # Map of every compressor used with any WAL file in the archive,
+        # to be used during this recovery
+        compressors = {}
+        compression_manager = self.backup_manager.compression_manager
+        # Fill xlogs and compressors maps from required_xlog_files
         for wal_info in required_xlog_files:
             hashdir = xlog.hash_dir(wal_info.name)
-            if hashdir not in xlogs:
-                xlogs[hashdir] = []
-            xlogs[hashdir].append(wal_info.name)
-        # Check decompression options
-        compressor = self.backup_manager.compression_manager.get_compressor()
+            xlogs[hashdir].append(wal_info)
+            # If a compressor is required, make sure it exists in the cache
+            if wal_info.compression is not None and \
+                    wal_info.compression not in compressors:
+                compressors[wal_info.compression] = \
+                    compression_manager.get_compressor(
+                        compression=wal_info.compression)
 
         rsync = RsyncPgData(
+            path=self.server.path,
             ssh=remote_command,
             bwlimit=self.config.bandwidth_limit,
             network_compression=self.config.network_compression)
+        # If compression is used and this is a remote recovery, we need a
+        # temporary directory where to spool uncompressed files,
+        # otherwise we either decompress every WAL file in the local
+        # destination, or we ship the uncompressed file remotely
+        if compressors:
+            if remote_command:
+                # Decompress to a temporary spool directory
+                wal_decompression_dest = tempfile.mkdtemp(
+                    prefix='barman_xlog-')
+            else:
+                # Decompress directly to the destination directory
+                wal_decompression_dest = wal_dest
+            # Make sure wal_decompression_dest exists
+            mkpath(wal_decompression_dest)
+        else:
+            # If no compression
+            wal_decompression_dest = None
         if remote_command:
             # If remote recovery tell rsync to copy them remotely
             # add ':' prefix to mark it as remote
-            # add '/' suffix to ensure it is a directory
-            wal_dest = ':%s/' % wal_dest
-        else:
-            # we will not use rsync: destdir must exists
-            mkpath(wal_dest)
-        if compressor and remote_command:
-            xlog_spool = tempfile.mkdtemp(prefix='barman_xlog-')
+            wal_dest = ':%s' % wal_dest
         total_wals = sum(map(len, xlogs.values()))
         partial_count = 0
         for prefix in sorted(xlogs):
@@ -798,46 +886,56 @@ class RecoveryExecutor(object):
                 total_wals,
                 xlogs[prefix][0],
                 xlogs[prefix][-1])
-            if compressor:
+            # If at least one compressed file has been found, activate
+            # compression check and decompression for each WAL files
+            if compressors:
+                for segment in xlogs[prefix]:
+                    dst_file = os.path.join(wal_decompression_dest,
+                                            segment.name)
+                    if segment.compression is not None:
+                        compressors[segment.compression].decompress(
+                            os.path.join(source_dir, segment.name),
+                            dst_file)
+                    else:
+                        shutil.copy2(os.path.join(source_dir, segment.name),
+                                     dst_file)
                 if remote_command:
-                    for segment in xlogs[prefix]:
-                        compressor.decompress(os.path.join(source_dir, segment),
-                                              os.path.join(xlog_spool, segment))
                     try:
-                        rsync.from_file_list(xlogs[prefix],
-                                             xlog_spool, wal_dest)
-                    except CommandFailedException, e:
-                        msg = "data transfer failure while copying WAL files " \
-                              "to directory '%s'" % (wal_dest[1:],)
+                        # Transfer the WAL files
+                        rsync.from_file_list(
+                            list(segment.name for segment in xlogs[prefix]),
+                            wal_decompression_dest, wal_dest)
+                    except CommandFailedException as e:
+                        msg = ("data transfer failure while copying WAL files "
+                               "to directory '%s'") % (wal_dest[1:],)
                         raise DataTransferFailure.from_rsync_error(e, msg)
 
                     # Cleanup files after the transfer
                     for segment in xlogs[prefix]:
-                        file_name = os.path.join(xlog_spool, segment)
+                        file_name = os.path.join(wal_decompression_dest,
+                                                 segment.name)
                         try:
                             os.unlink(file_name)
                         except OSError as e:
                             output.warning(
                                 "Error removing temporary file '%s': %s",
                                 file_name, e)
-                else:
-                    # decompress directly to the right place
-                    for segment in xlogs[prefix]:
-                        compressor.decompress(os.path.join(source_dir, segment),
-                                              os.path.join(wal_dest, segment))
             else:
                 try:
                     rsync.from_file_list(
-                        xlogs[prefix],
-                        "%s/" % os.path.join(
-                            self.config.wals_directory, prefix),
+                        list(segment.name for segment in xlogs[prefix]),
+                        "%s/" % os.path.join(self.config.wals_directory,
+                                             prefix),
                         wal_dest)
-                except CommandFailedException, e:
+                except CommandFailedException as e:
                     msg = "data transfer failure while copying WAL files " \
                           "to directory '%s'" % (wal_dest[1:],)
                     raise DataTransferFailure.from_rsync_error(e, msg)
 
         _logger.info("Finished copying %s WAL files.", total_wals)
 
-        if compressor and remote_command:
-            shutil.rmtree(xlog_spool)
+        # Remove local decompression target directory if different from the
+        # destination directory (it happens when compression is in use during a
+        # remote recovery
+        if wal_decompression_dest and wal_decompression_dest != wal_dest:
+            shutil.rmtree(wal_decompression_dest)

@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2011-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -20,45 +20,138 @@ This module represents a Server.
 Barman is able to manage multiple servers.
 """
 
-from contextlib import contextmanager
+import itertools
 import logging
 import os
+import shutil
+import sys
+from collections import namedtuple
+from contextlib import contextmanager
+from tempfile import NamedTemporaryFile
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
-from barman import output
+import barman
+from barman import output, xlog
 from barman.backup import BackupManager
-from barman.config import BackupOptions
-from barman.infofile import BackupInfo, UnknownBackupIdException, Tablespace, \
-    WalFileInfo
-from barman.lockfile import LockFileBusy, LockFilePermissionDenied, \
-    ServerBackupLock, ServerCronLock, ServerXLOGDBLock
+from barman.command_wrappers import BarmanSubProcess
+from barman.compression import identify_compression
+from barman.infofile import BackupInfo, UnknownBackupIdException, WalFileInfo
+from barman.lockfile import (LockFileBusy, LockFilePermissionDenied,
+                             ServerBackupLock, ServerCronLock,
+                             ServerWalArchiveLock, ServerWalReceiveLock,
+                             ServerXLOGDBLock)
+from barman.postgres import (ConninfoException, PostgreSQLConnection,
+                             StreamingConnection)
+from barman.process import ProcessManager
+from barman.remote_status import RemoteStatusMixin
 from barman.retention_policies import RetentionPolicyFactory
-from barman.utils import human_readable_timedelta
-import barman.xlog as xlog
-
+from barman.utils import human_readable_timedelta, pretty_size
+from barman.wal_archiver import (ArchiverFailure, FileWalArchiver,
+                                 StreamingWalArchiver, WalArchiver)
 
 _logger = logging.getLogger(__name__)
 
 
-class ConninfoException(Exception):
+class CheckStrategy(object):
     """
-    Error parsing conninfo parameter
-    """
-
-
-class PostgresConnectionError(Exception):
-    """
-    Error connecting to PostgreSQL server.
+    This strategy for the 'check' collects the results of
+    every check and does not print any message.
+    This basic class is also responsible for immediately
+    logging any performed check with an error in case of
+    check failure and a debug message in case of success.
     """
 
+    # create a namedtuple object called CheckResult to manage check results
+    CheckResult = namedtuple('CheckResult', 'server_name check status')
 
-class Server(object):
+    # Default list used as a filter to identify non-critical checks
+    NON_CRITICAL_CHECKS = ['minimum redundancy requirements',
+                           'backup maximum age',
+                           'failed backups',
+                           'archiver errors']
+
+    def __init__(self, ignore_checks=NON_CRITICAL_CHECKS):
+        """
+        Silent Strategy constructor
+
+        :param list ignore_checks: list of checks that can be ignored
+        """
+        self.ignore_list = ignore_checks
+        self.check_result = []
+        self.has_error = False
+
+    def result(self, server_name, check, status, hint=None):
+        """
+        Store the result of a check (with no output).
+        Log any check result (error or debug level).
+
+        :param str server_name: the server is being checked
+        :param str check: the check name
+        :param bool status: True if succeeded
+        :param str,None hint: hint to print if not None:
+        """
+        if not status:
+            # If the name of the check is not in the filter list,
+            # treat it as a blocking error, then notify the error
+            # and change the status of the strategy
+            if check not in self.ignore_list:
+                self.has_error = True
+                _logger.error(
+                    "Check '%s' failed for server '%s'" %
+                    (check, server_name))
+            else:
+                # otherwise simply log the error (as info)
+                _logger.info(
+                    "Ignoring failed check '%s' for server '%s'" %
+                    (check, server_name))
+        else:
+            _logger.debug(
+                "Check '%s' succeeded for server '%s'" %
+                (check, server_name))
+
+        # Store the result and does not output anything
+        result = self.CheckResult(server_name, check, status)
+        self.check_result.append(result)
+
+
+class CheckOutputStrategy(CheckStrategy):
+    """
+    This strategy for the 'check' command immediately sends
+    the result of a check to the designated output channel.
+    This class derives from the basic CheckStrategy, reuses
+    the same logic and adds output messages.
+    """
+
+    def __init__(self):
+        """
+        Output Strategy constructor
+        """
+        super(CheckOutputStrategy, self).__init__(ignore_checks=())
+
+    def result(self, server_name, check, status, hint=None):
+        """
+        Output Strategy constructor
+
+        :param str server_name: the server being checked
+        :param str check: the check name
+        :param bool status: True if succeeded
+        :param str,None hint: hint to print if not None:
+        """
+        # Call the basic method
+        super(CheckOutputStrategy, self).result(
+            server_name, check, status, hint)
+        # Send result to output
+        output.result('check', server_name, check, status, hint)
+
+
+class Server(RemoteStatusMixin):
     """
     This class represents the PostgreSQL server to backup.
     """
+
     XLOG_DB = "xlog.db"
+
+    # the strategy for the management of the results of the various checks
+    __default_check_strategy = CheckOutputStrategy()
 
     def __init__(self, config):
         """
@@ -66,17 +159,62 @@ class Server(object):
 
         :param barman.config.ServerConfig config: the server configuration
         """
+        super(Server, self).__init__()
         self.config = config
-        self._conn = None
-        self.server_txt_version = None
-        self.server_version = None
-        if self.config.conninfo is None:
-            raise ConninfoException(
-                'Missing conninfo parameter in barman configuration '
-                'for server %s' % config.name)
+        self.path = self._build_path(self.config.path_prefix)
+        self.process_manager = ProcessManager(self.config)
         self.backup_manager = BackupManager(self)
-        self.configuration_files = None
+        self.streaming = None
         self.enforce_retention_policies = False
+        self.postgres = None
+        self.streaming = None
+
+        try:
+            self.postgres = PostgreSQLConnection(config)
+        # If the PostgreSQLConnection creation fails, disable the Server
+        except ConninfoException as e:
+            self.config.disabled = True
+            self.config.msg_list.append(str(e).strip())
+
+        # Order of items in self.archivers list is important!
+        # The files will be archived in that order.
+        self.archivers = []
+        try:
+            if self.config.archiver:
+                self.archivers.append(FileWalArchiver(self.backup_manager))
+            else:
+                # Currently a server MUST have archiver set to on,
+                # otherwise disable the server.
+                self.config.disabled = True
+                self.config.msg_list.append("The option archiver = off "
+                                            "is not yet supported")
+        except AttributeError as e:
+            _logger.debug(e)
+            self.config.disabled = True
+            self.config.msg_list.append('Unable to initialise the '
+                                        'file based archiver')
+        try:
+            if self.config.streaming_archiver:
+                try:
+                    self.streaming = StreamingConnection(config)
+                    self.archivers.append(StreamingWalArchiver(
+                        self.backup_manager))
+                # If the StreamingConnection creation fails, disable the Server
+                except ConninfoException as e:
+                    self.config.disabled = True
+                    self.config.msg_list.append(str(e).strip())
+        except AttributeError as e:
+            _logger.debug(e)
+            self.config.disabled = True
+            self.config.msg_list.append('Unable to initialise the '
+                                        'streaming archiver')
+        if len(self.archivers) < 1:
+            self.config.disabled = True
+            self.config.msg_list.append(
+                "Missing archiver for server %s. "
+                "Enable at least the 'archiver' option in "
+                "the server configuration"
+                % config.name)
 
         # Set bandwidth_limit
         if self.config.bandwidth_limit:
@@ -108,7 +246,8 @@ class Server(object):
 
         # Set minimum redundancy (default 0)
         if self.config.minimum_redundancy.isdigit():
-            self.config.minimum_redundancy = int(self.config.minimum_redundancy)
+            self.config.minimum_redundancy = int(
+                self.config.minimum_redundancy)
             if self.config.minimum_redundancy < 0:
                 _logger.warning('Negative value of minimum_redundancy "%s" '
                                 'for server "%s" (fallback to "0")' % (
@@ -156,16 +295,19 @@ class Server(object):
                     rp = RetentionPolicyFactory.create(
                         self, 'wal_retention_policy',
                         self.config.wal_retention_policy)
-                    # Reassign the configuration value (we keep it in one place)
+                    # Reassign the configuration value
+                    # (we keep it in one place)
                     self.config.wal_retention_policy = rp
                     _logger.debug(
                         'WAL retention policy for server %s: %s' % (
-                            self.config.name, self.config.wal_retention_policy))
+                            self.config.name,
+                            self.config.wal_retention_policy))
                 except ValueError:
                     _logger.exception(
                         'Invalid wal_retention_policy setting "%s" '
                         'for server "%s" (fallback to "main")' % (
-                            self.config.wal_retention_policy, self.config.name))
+                            self.config.wal_retention_policy,
+                            self.config.name))
                     rp = RetentionPolicyFactory.create(
                         self, 'wal_retention_policy', 'main')
                     self.config.wal_retention_policy = rp
@@ -177,74 +319,83 @@ class Server(object):
                     'Invalid retention_policy setting "%s" for server "%s"' % (
                         self.config.retention_policy, self.config.name))
 
-    def check(self):
+    def check(self, check_strategy=__default_check_strategy):
         """
         Implements the 'server check' command and makes sure SSH and PostgreSQL
         connections work properly. It checks also that backup directories exist
         (and if not, it creates them).
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
         """
         # Check postgres configuration
-        self.check_postgres()
+        self.check_postgres(check_strategy)
         # Check barman directories from barman configuration
-        self.check_directories()
+        self.check_directories(check_strategy)
         # Check retention policies
-        self.check_retention_policy_settings()
+        self.check_retention_policy_settings(check_strategy)
         # Check for backup validity
-        self.check_backup_validity()
+        self.check_backup_validity(check_strategy)
         # Executes the backup manager set of checks
-        self.backup_manager.check()
+        self.backup_manager.check(check_strategy)
+        # Check if the msg_list of the server
+        # contains messages and output eventual failures
+        self.check_configuration(check_strategy)
 
-    def check_postgres(self):
+        # Executes check() for every archiver, passing
+        # remote status information for efficiency
+        for archiver in self.archivers:
+            archiver.check(check_strategy)
+
+        # Check archiver errors
+        self.check_archiver_errors(check_strategy)
+
+    def check_postgres(self, check_strategy):
         """
         Checks PostgreSQL connection
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
         """
         # Take the status of the remote server
-        try:
-            remote_status = self.get_remote_status()
-        except PostgresConnectionError:
-            remote_status = None
-        if remote_status is not None and remote_status['server_txt_version']:
-            output.result('check', self.config.name, 'PostgreSQL', True)
+        remote_status = self.get_remote_status()
+        if remote_status.get('server_txt_version'):
+            check_strategy.result(self.config.name, 'PostgreSQL', True)
         else:
-            output.result('check', self.config.name, 'PostgreSQL', False)
+            check_strategy.result(self.config.name, 'PostgreSQL', False)
             return
-
-        if BackupOptions.CONCURRENT_BACKUP in self.config.backup_options:
-            if remote_status['pgespresso_installed']:
-                output.result('check', self.config.name,
-                        'pgespresso extension', True)
+        # Check for superuser privileges in PostgreSQL
+        if remote_status.get('is_superuser') is not None:
+            if remote_status.get('is_superuser'):
+                check_strategy.result(
+                    self.config.name, 'superuser', True)
             else:
-                output.result('check', self.config.name,
-                          'pgespresso extension',
-                          False,
-                          'required for concurrent backups')
-        # Check archive_mode parameter: must be on
-        if remote_status['archive_mode'] == 'on':
-            output.result('check', self.config.name, 'archive_mode', True)
-        else:
-            output.result('check', self.config.name, 'archive_mode', False,
-                          "please set it to 'on'")
-        # Check wal_level parameter: must be different to 'minimal'
-        if remote_status['wal_level'] != 'minimal':
-            output.result('check', self.config.name, 'wal_level', True)
-        else:
-            output.result('check', self.config.name, 'wal_level', False,
-                          "please set it to a higher level than 'minimal'")
+                check_strategy.result(
+                    self.config.name, 'not superuser', False,
+                    'superuser privileges for PostgreSQL connection required')
 
-        if remote_status['archive_command'] and \
-                remote_status['archive_command'] != '(disabled)':
-            output.result('check', self.config.name, 'archive_command', True)
-            # Report if the archiving process works without issues.
-            # Skip if the archive_command check fails
-            # It can be None if PostgreSQL is older than 9.4
-            if remote_status.get('is_archiving') is not None:
-                output.result('check',
-                              self.config.name,
-                              'continuous archiving',
-                              remote_status['is_archiving'])
-        else:
-            output.result('check', self.config.name, 'archive_command', False,
-                          'please set it accordingly to documentation')
+        if 'streaming_supported' in remote_status:
+            hint = None
+
+            # If a streaming connection is available,
+            # add its status to the output of the check
+            if remote_status['streaming_supported'] is None:
+                hint = 'Streaming connection error'
+            elif not remote_status['streaming_supported']:
+                hint = ('Streaming connection not supported'
+                        ' for PostgreSQL < 9.2')
+            check_strategy.result(self.config.name, 'PostgreSQL streaming',
+                                  remote_status.get('streaming'), hint)
+        # Check wal_level parameter: must be different from 'minimal'
+        # the parameter has been introduced in postgres >= 9.0
+        if 'wal_level' in remote_status:
+            if remote_status['wal_level'] != 'minimal':
+                check_strategy.result(
+                    self.config.name, 'wal_level', True)
+            else:
+                check_strategy.result(
+                    self.config.name, 'wal_level', False,
+                    "please set it to a higher level than 'minimal'")
 
     def _make_directories(self):
         """
@@ -254,41 +405,60 @@ class Server(object):
             if key.endswith('_directory') and hasattr(self.config, key):
                 val = getattr(self.config, key)
                 if val is not None and not os.path.isdir(val):
-                    #noinspection PyTypeChecker
+                    # noinspection PyTypeChecker
                     os.makedirs(val)
 
-    def check_directories(self):
+    def check_directories(self, check_strategy):
         """
         Checks backup directories and creates them if they do not exist
-        """
 
-        if self.config.disabled:
-            output.result('check', self.config.name, 'directories', False)
-            for conflict_paths in self.config.msg_list:
-                output.info("\t%s" % conflict_paths)
-        else:
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
+        """
+        if not self.config.disabled:
             try:
                 self._make_directories()
-            except OSError, e:
-                output.result('check', self.config.name, 'directories', False,
-                              "%s: %s" % (e.filename, e.strerror))
+            except OSError as e:
+                check_strategy.result(self.config.name, 'directories', False,
+                                      "%s: %s" % (e.filename, e.strerror))
             else:
-                output.result('check', self.config.name, 'directories', True)
+                check_strategy.result(self.config.name, 'directories', True)
 
-    def check_retention_policy_settings(self):
+    def check_configuration(self, check_strategy):
+        """
+        Check for error messages in the message list
+        of the server and output eventual errors
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
+        """
+        if self.config.disabled:
+            check_strategy.result(self.config.name, 'configuration', False)
+            for conflict_paths in self.config.msg_list:
+                output.info("\t\t%s" % conflict_paths)
+
+    def check_retention_policy_settings(self, check_strategy):
         """
         Checks retention policy setting
-        """
-        if self.config.retention_policy and not self.enforce_retention_policies:
-            output.result('check', self.config.name,
-                          'retention policy settings', False, 'see log')
-        else:
-            output.result('check', self.config.name,
-                          'retention policy settings', True)
 
-    def check_backup_validity(self):
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
+        """
+        if (self.config.retention_policy and
+                not self.enforce_retention_policies):
+            check_strategy.result(self.config.name,
+                                  'retention policy settings', False,
+                                  'see log')
+        else:
+            check_strategy.result(self.config.name,
+                                  'retention policy settings', True)
+
+    def check_backup_validity(self, check_strategy):
         """
         Check if backup validity requirements are satisfied
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
         """
         # first check: check backup maximum age
         if self.config.last_backup_maximum_age is not None:
@@ -297,18 +467,37 @@ class Server(object):
                 self.config.last_backup_maximum_age)
 
             # format the output
-            output.result('check', self.config.name,
-                          'backup maximum age', backup_age[0],
-                          "interval provided: %s, latest backup age: %s" %
-                          (human_readable_timedelta(
-                              self.config.last_backup_maximum_age),
-                           backup_age[1]))
+            check_strategy.result(
+                self.config.name, 'backup maximum age',
+                backup_age[0],
+                "interval provided: %s, latest backup age: %s" % (
+                    human_readable_timedelta(
+                        self.config.last_backup_maximum_age), backup_age[1]))
         else:
             # last_backup_maximum_age provided by the user
-            output.result('check', self.config.name,
-                          'backup maximum age',
-                          True,
-                          "no last_backup_maximum_age provided")
+            check_strategy.result(
+                self.config.name, 'backup maximum age', True,
+                "no last_backup_maximum_age provided")
+
+    def check_archiver_errors(self, check_strategy):
+        """
+        Checks the presence of archiving errors
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the check
+        """
+
+        if os.path.isdir(self.config.errors_directory):
+            errors = os.listdir(self.config.errors_directory)
+        else:
+            errors = []
+
+        check_strategy.result(
+            self.config.name,
+            "archiver errors",
+            len(errors) == 0,
+            WalArchiver.summarise_error_files(errors)
+        )
 
     def status_postgres(self):
         """
@@ -332,6 +521,11 @@ class Server(object):
         else:
             output.result('status', self.config.name, 'pgespresso',
                           'pgespresso extension', "Not available")
+        if remote_status.get('current_size') is not None:
+            output.result('status', self.config.name,
+                          'current_size',
+                          'Current data size',
+                          pretty_size(remote_status['current_size']))
         if remote_status['data_directory']:
             output.result('status', self.config.name,
                           "data_directory",
@@ -411,134 +605,27 @@ class Server(object):
         # Executes the backup manager status info method
         self.backup_manager.status()
 
-    def pg_espresso_installed(self):
-        """
-        Returns true if pgexpresso extension is available
-        """
-        try:
-            with self.pg_connect() as conn:
-                # pg_extension is only available from Postgres 9.1+
-                if self.server_version < 90100:
-                    return False
-                cur = conn.cursor()
-                cur.execute("select count(*) from pg_extension "
-                            "where extname = 'pgespresso'")
-                q_result = cur.fetchone()[0]
-                if q_result > 0:
-                    return True
-                else:
-                    return False
-        except (PostgresConnectionError, psycopg2.Error) as e:
-            _logger.debug("Error retrieving pgespresso information: %s", e)
-            return False
-
-    def get_pg_stat_archiver(self):
-        """
-        This method gathers statistics from pg_stat_archiver
-        (postgres 9.4+ or greater required)
-
-        :return dict|None: a dictionary containing Postgres statistics from
-            pg_stat_archiver or None
-        """
-        try:
-            with self.pg_connect() as conn:
-                # pg_stat_archiver is only available from Postgres 9.4+
-                if self.server_version < 90400:
-                    return None
-                cur = conn.cursor(cursor_factory=RealDictCursor)
-                # Select from pg_stat_archiver statistics view,
-                # retrieving statistics about WAL archiver process activity,
-                # also evaluating if the server is archiving without issues
-                # and the archived WALs per second rate
-                cur.execute(
-                    "SELECT *, current_setting('archive_mode')::BOOLEAN "
-                    "AND (last_failed_wal IS NULL "
-                    "OR last_failed_wal <= last_archived_wal) "
-                    "AS is_archiving, "
-                    "CAST (archived_count AS NUMERIC) "
-                    "/ EXTRACT (EPOCH FROM age(now(), stats_reset)) "
-                    "AS current_archived_wals_per_second "
-                    "FROM pg_stat_archiver")
-                q_result = cur.fetchone()
-                if q_result:
-                    return q_result
-                else:
-                    return None
-        except (PostgresConnectionError, psycopg2.Error) as e:
-            _logger.debug("Error retrieving pg_stat_archive data: %s", e)
-            return None
-
-    def pg_is_in_recovery(self):
-        """
-        Returns true if PostgreSQL server is in recovery mode
-        """
-        try:
-            with self.pg_connect() as conn:
-                # pg_is_in_recovery is only available from Postgres 9.0+
-                if self.server_version < 90000:
-                    return False
-                cur = conn.cursor()
-                cur.execute("select pg_is_in_recovery()")
-                q_result = cur.fetchone()[0]
-                if q_result:
-                    return True
-                else:
-                    return False
-        except (PostgresConnectionError, psycopg2.Error) as e:
-            _logger.debug("Error calling pg_is_in_recovery() function: %s", e)
-            return None
-
-    def get_remote_status(self):
+    def fetch_remote_status(self):
         """
         Get the status of the remote server
 
-        :return dict[str, None]: result of the server status query
+        This method does not raise any exception in case of errors,
+        but set the missing values to None in the resulting dictionary.
+
+        :rtype: dict[str, None|str]
         """
-        # PostgreSQL settings to get from the server
-        pg_settings = (
-            'wal_level', 'archive_mode', 'archive_command', 'data_directory')
-        pg_query_keys = (
-            'server_txt_version', 'current_xlog', 'pgespresso_installed')
-
-        # Initialise the result dictionary setting all the values to None
-        result = dict.fromkeys(pg_settings + pg_query_keys, None)
-        try:
-            with self.pg_connect() as conn:
-                for name in pg_settings:
-                    result[name] = self.get_pg_setting(name)
-
-                try:
-                    cur = conn.cursor()
-                    cur.execute("SELECT version()")
-                    result['server_txt_version'] = cur.fetchone()[0].split()[1]
-                except psycopg2.Error, e:
-                    _logger.debug(
-                        "Error retrieving PostgreSQL version: %s", e)
-
-                result['pgespresso_installed'] = self.pg_espresso_installed()
-
-                try:
-                    if not self.pg_is_in_recovery():
-                        cur = conn.cursor()
-                        cur.execute(
-                            'SELECT pg_xlogfile_name('
-                            'pg_current_xlog_location())')
-                        result['current_xlog'] = cur.fetchone()[0]
-                except psycopg2.Error, e:
-                    _logger.debug("Error retrieving current xlog: %s", e)
-
-                result.update(self.get_pg_configuration_files())
-
-                # Add pg_stat_archiver statistics if the view is supported
-                pg_stat_archiver = self.get_pg_stat_archiver()
-                if pg_stat_archiver is not None:
-                    result.update(pg_stat_archiver)
-
-                # Merge additional status defined by the BackupManager
-                result.update(self.backup_manager.get_remote_status())
-
-        except (PostgresConnectionError, psycopg2.Error) as e:
-            _logger.warn("Error retrieving PostgreSQL status: %s", e)
+        result = {}
+        # Merge status for a postgres connection
+        if self.postgres:
+            result.update(self.postgres.get_remote_status())
+        # Merge status for a streaming connection
+        if self.streaming:
+            result.update(self.streaming.get_remote_status())
+        # Merge status for each archiver
+        for archiver in self.archivers:
+            result.update(archiver.get_remote_status())
+        # Merge status defined by the BackupManager
+        result.update(self.backup_manager.get_remote_status())
         return result
 
     def show(self):
@@ -577,149 +664,112 @@ class Server(object):
             result['last_backup_maximum_age'] = "None"
         output.result('show_server', self.config.name, result)
 
-    @contextmanager
-    def pg_connect(self):
-        """
-        A generic function to connect to Postgres using Psycopg2
-        """
-        myconn = self._conn is None
-        if myconn:
-            try:
-                self._conn = psycopg2.connect(self.config.conninfo)
-                self.server_version = self._conn.server_version
-                if (self.server_version >= 90000 and
-                        'application_name=' not in self.config.conninfo):
-                    cur = self._conn.cursor()
-                    cur.execute('SET application_name TO barman')
-                    cur.close()
-            # If psycopg2 fails to connect to the host,
-            # raise the appropriate exception
-            except psycopg2.DatabaseError as e:
-                raise PostgresConnectionError(
-                    "Cannot connect to postgres: %s" % e)
-        try:
-            yield self._conn
-        finally:
-            if myconn:
-                self._conn.close()
-                self._conn = None
-
-    def get_pg_setting(self, name):
-        """
-        Get a postgres setting with a given name
-
-        :param name: a parameter name
-        """
-
-        try:
-            with self.pg_connect() as conn:
-                cur = conn.cursor()
-                cur.execute('SHOW "%s"' % name.replace('"', '""'))
-                return cur.fetchone()[0]
-        except (PostgresConnectionError, psycopg2.Error) as e:
-            _logger.debug("Error retrieving PostgreSQL setting '%s': %s",
-                          name.replace('"', '""'), e)
-            return None
-
-    def get_pg_tablespaces(self):
-        """
-        Returns a list of tablespaces or None if not present
-        """
-
-        try:
-            with self.pg_connect() as conn:
-                cur = conn.cursor()
-                if self.server_version >= 90200:
-                    cur.execute(
-                        "SELECT spcname, oid, "
-                        "pg_tablespace_location(oid) AS spclocation "
-                        "FROM pg_tablespace "
-                        "WHERE pg_tablespace_location(oid) != ''")
-                else:
-                    cur.execute(
-                        "SELECT spcname, oid, spclocation "
-                        "FROM pg_tablespace WHERE spclocation != ''")
-                # Generate a list of tablespace objects
-                return [Tablespace._make(item) for item in cur.fetchall()]
-        except (PostgresConnectionError, psycopg2.Error) as e:
-            _logger.debug("Error retrieving PostgreSQL tablespaces: %s", e)
-            return None
-
-    def get_pg_configuration_files(self):
-        """
-        Get postgres configuration files or an empty dictionary in case of error
-        """
-        if self.configuration_files:
-            return self.configuration_files
-        try:
-            with self.pg_connect() as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT name, setting FROM pg_settings "
-                            "WHERE name IN ("
-                            "'config_file', 'hba_file', 'ident_file')")
-                self.configuration_files = {}
-                for cname, cpath in cur.fetchall():
-                    self.configuration_files[cname] = cpath
-                return self.configuration_files
-        except (PostgresConnectionError, psycopg2.Error) as e:
-            _logger.debug("Error retrieving PostgreSQL configuration files "
-                          "location: %s", e)
-            return {}
-
     def delete_backup(self, backup):
-        '''Deletes a backup
+        """Deletes a backup
 
         :param backup: the backup to delete
-        '''
-        return self.backup_manager.delete_backup(backup)
+        """
+        try:
+            # Lock acquisition: if you can acquire a ServerBackupLock
+            # it means that no backup process is running on that server,
+            # so there is no need to check the backup status.
+            # Simply proceed with the normal delete process.
+            server_backup_lock = ServerBackupLock(
+                self.config.barman_lock_directory,
+                self.config.name)
+            server_backup_lock.acquire(server_backup_lock.raise_if_fail,
+                                       server_backup_lock.wait)
+            server_backup_lock.release()
+            return self.backup_manager.delete_backup(backup)
+
+        except LockFileBusy:
+            # Otherwise if the lockfile is busy, a backup process is actually
+            # running on that server. To be sure that it's safe
+            # to delete the backup, we must check its status and its position
+            # in the catalogue.
+            # If it is the first and it is STARTED or EMPTY, we are trying to
+            # remove a running backup. This operation must be forbidden.
+            # Otherwise, normally delete the backup.
+            first_backup_id = self.get_first_backup_id(BackupInfo.STATUS_ALL)
+            if backup.backup_id == first_backup_id \
+                    and backup.status in (BackupInfo.STARTED,
+                                          BackupInfo.EMPTY):
+                output.error("Cannot delete a running backup (%s %s)"
+                             % (self.config.name, backup.backup_id))
+            else:
+                return self.backup_manager.delete_backup(backup)
+
+        except LockFilePermissionDenied as e:
+            # We cannot access the lockfile.
+            # Exit without removing the backup.
+            output.error("Permission denied, unable to access '%s'" % e)
 
     def backup(self):
         """
         Performs a backup for the server
         """
         try:
+            # Default strategy for check in backup is CheckStrategy
+            # This strategy does not print any output - it only logs checks
+            strategy = CheckStrategy()
+            self.check(strategy)
+            if strategy.has_error:
+                output.error("Impossible to start the backup. Check the log "
+                             "for more details, or run 'barman check %s'"
+                             % self.config.name)
+                return
             # check required backup directories exist
             self._make_directories()
-        except OSError, e:
+        except OSError as e:
             output.error('failed to create %s directory: %s',
                          e.filename, e.strerror)
             return
 
         try:
             # lock acquisition and backup execution
-            with ServerBackupLock(self.config.barman_lock_directory, self.config.name):
+            with ServerBackupLock(self.config.barman_lock_directory,
+                                  self.config.name):
                 self.backup_manager.backup()
-            # Archive incoming WALs and update WAL catalogue through cron
-            self.cron(verbose=False, retention_policies=False)
+            # Archive incoming WALs and update WAL catalogue
+            self.archive_wal(verbose=False)
 
         except LockFileBusy:
             output.error("Another backup process is running")
 
-        except LockFilePermissionDenied, e:
+        except LockFilePermissionDenied as e:
             output.error("Permission denied, unable to access '%s'" % e)
 
-    def get_available_backups(self, status_filter=BackupManager.DEFAULT_STATUS_FILTER):
-        '''Get a list of available backups
+    def get_available_backups(
+            self, status_filter=BackupManager.DEFAULT_STATUS_FILTER):
+        """
+        Get a list of available backups
 
-        param: status_filter: the status of backups to return, default to BackupManager.DEFAULT_STATUS_FILTER
-        '''
+        param: status_filter: the status of backups to return,
+            default to BackupManager.DEFAULT_STATUS_FILTER
+        """
         return self.backup_manager.get_available_backups(status_filter)
 
-    def get_last_backup(self, status_filter=BackupManager.DEFAULT_STATUS_FILTER):
-        '''
-        Get the last backup (if any) in the catalog
+    def get_last_backup_id(
+            self, status_filter=BackupManager.DEFAULT_STATUS_FILTER):
+        """
+        Get the id of the latest/last backup in the catalog (if exists)
 
-        :param status_filter: default DEFAULT_STATUS_FILTER. The status of the backup returned
-        '''
-        return self.backup_manager.get_last_backup(status_filter)
+        :param status_filter: The status of the backup to return,
+            default to DEFAULT_STATUS_FILTER.
+        :return string|None: ID of the backup
+        """
+        return self.backup_manager.get_last_backup_id(status_filter)
 
-    def get_first_backup(self, status_filter=BackupManager.DEFAULT_STATUS_FILTER):
-        '''
-        Get the first backup (if any) in the catalog
+    def get_first_backup_id(
+            self, status_filter=BackupManager.DEFAULT_STATUS_FILTER):
+        """
+        Get the id of the oldest/first backup in the catalog (if exists)
 
-        :param status_filter: default DEFAULT_STATUS_FILTER. The status of the backup returned
-        '''
-        return self.backup_manager.get_first_backup(status_filter)
+        :param status_filter: The status of the backup to return,
+            default to DEFAULT_STATUS_FILTER.
+        :return string|None: ID of the backup
+        """
+        return self.backup_manager.get_first_backup_id(status_filter)
 
     def list_backups(self):
         """
@@ -727,20 +777,28 @@ class Server(object):
         """
         retention_status = self.report_backups()
         backups = self.get_available_backups(BackupInfo.STATUS_ALL)
-        for key in sorted(backups.iterkeys(), reverse=True):
+        for key in sorted(backups.keys(), reverse=True):
             backup = backups[key]
 
-            backup_size = 0
+            backup_size = backup.size or 0
             wal_size = 0
             rstatus = None
             if backup.status == BackupInfo.DONE:
-                wal_info = self.get_wal_info(backup)
-                backup_size = backup.size or 0 + wal_info['wal_size']
-                wal_size = wal_info['wal_until_next_size']
+                try:
+                    wal_info = self.get_wal_info(backup)
+                    backup_size += wal_info['wal_size']
+                    wal_size = wal_info['wal_until_next_size']
+                except xlog.BadXlogSegmentName as e:
+                    output.error(
+                        "invalid xlog segment name %r\n"
+                        "HINT: Please run \"barman rebuild-xlogdb %s\" "
+                        "to solve this issue",
+                        str(e), self.config.name)
                 if self.enforce_retention_policies and \
                         retention_status[backup.backup_id] != BackupInfo.VALID:
                     rstatus = retention_status[backup.backup_id]
-            output.result('list_backup', backup, backup_size, wal_size, rstatus)
+            output.result('list_backup', backup, backup_size, wal_size,
+                          rstatus)
 
     def get_backup(self, backup_id):
         """
@@ -770,8 +828,8 @@ class Server(object):
         """
         return self.backup_manager.get_next_backup(backup_id)
 
-    def get_required_xlog_files(self, backup, target_tli=None, target_time=None,
-                                target_xid=None):
+    def get_required_xlog_files(self, backup, target_tli=None,
+                                target_time=None, target_xid=None):
         """
         Get the xlog files required for a recovery
         """
@@ -938,41 +996,313 @@ class Server(object):
 
         :param barman.infofile.BackupInfo backup_info: the backup to recover
         :param str dest: the destination directory
-        :param dict[str,str]|None tablespaces: a tablespace name -> location map
-            (for relocation)
+        :param dict[str,str]|None tablespaces: a tablespace
+            name -> location map (for relocation)
         :param str|None target_tli: the target timeline
         :param str|None target_time: the target time
         :param str|None target_xid: the target xid
         :param str|None target_name: the target name created previously with
                             pg_create_restore_point() function call
         :param bool exclusive: whether the recovery is exclusive or not
-        :param str|None remote_command: default None. The remote command to recover
-                               the base backup, in case of remote backup.
+        :param str|None remote_command: default None. The remote command to
+            recover the base backup, in case of remote backup.
         """
         return self.backup_manager.recover(
-            backup_info, dest, tablespaces, target_tli, target_time, target_xid,
-            target_name, exclusive, remote_command, disable_checksum)
+            backup_info, dest, tablespaces, target_tli, target_time,
+            target_xid, target_name, exclusive, remote_command, disable_checksum)
 
-    def cron(self, verbose=True, wals=True, retention_policies=True):
+    def get_wal(self, wal_name, compression=None, output_directory=None,
+                peek=None):
+        """
+        Retrieve a WAL file from the archive
+
+        :param str wal_name: id of the WAL file to find into the WAL archive
+        :param str|None compression: compression format for the output
+        :param str|None output_directory: directory where to deposit the
+            WAL file
+        :param int|None peek: if defined list the next N WAL file
+        """
+
+        # Sanity check
+        if not xlog.is_any_xlog_file(wal_name):
+            output.error("'%s' is not a valid wal file name", wal_name)
+            return
+
+        # If peek is requested we only output a list of files
+        if peek:
+            # Get the next ``peek`` files following the provided ``wal_name``.
+            # If ``wal_name`` is not a simple wal file,
+            # we cannot guess the names of the following WAL files.
+            # So ``wal_name`` is the only possible result, if exists.
+            if xlog.is_wal_file(wal_name):
+                wal_peek_list = itertools.islice(
+                    xlog.generate_segment_names(wal_name), peek)
+            else:
+                wal_peek_list = [wal_name]
+            # Output the content of wal_peek_list until we find a missing file
+            for wal_peek_name in wal_peek_list:
+                wal_peek_file = self.get_wal_full_path(wal_peek_name)
+                # If ``wal_peek_file`` doesn't exist, stop the process
+                if not os.path.exists(wal_peek_file):
+                    return
+                output.info(wal_peek_name, log=False)
+            # Do not output anything else
+            return
+
+        # Get the WAL file full path
+        wal_file = self.get_wal_full_path(wal_name)
+
+        # Check for file existence
+        if not os.path.exists(wal_file):
+            output.error("WAL file '%s' not found in server '%s'",
+                         wal_name, self.config.name)
+            return
+
+        # If an output directory was provided write the file inside it
+        # otherwise we use standard output
+        if output_directory is not None:
+            destination_path = os.path.join(output_directory, wal_name)
+            try:
+                destination = open(destination_path, 'w')
+                output.info("Writing WAL '%s' for server '%s' into '%s' file",
+                            wal_name, self.config.name, destination_path)
+            except IOError as e:
+                output.error("Unable to open '%s' file: %s" %
+                             destination_path, e)
+                return
+        else:
+            destination = sys.stdout
+
+        # Get a decompressor for the file (None if not compressed)
+        wal_compressor = self.backup_manager.compression_manager \
+            .get_compressor(compression=identify_compression(wal_file))
+
+        # Get a compressor for the output (None if not compressed)
+        # Here we need to handle explicitly the None value because we don't
+        # want it ot fallback to the configured compression
+        if compression is not None:
+            out_compressor = self.backup_manager.compression_manager \
+                .get_compressor(compression=compression)
+        else:
+            out_compressor = None
+
+        # Initially our source is the stored WAL file and we do not have
+        # any temporary file
+        source_file = wal_file
+        uncompressed_file = None
+        compressed_file = None
+
+        # If the required compression is different from the source we
+        # decompress/compress it into the required format (getattr is
+        # used here to gracefully handle None objects)
+        if getattr(wal_compressor, 'compression', None) != \
+                getattr(out_compressor, 'compression', None):
+            # If source is compressed, decompress it into a temporary file
+            if wal_compressor is not None:
+                uncompressed_file = NamedTemporaryFile(
+                    dir=self.config.wals_directory,
+                    prefix='.%s.' % wal_name,
+                    suffix='.uncompressed')
+                # decompress wal file
+                wal_compressor.decompress(source_file, uncompressed_file.name)
+                source_file = uncompressed_file.name
+
+            # If output compression is required compress the source
+            # into a temporary file
+            if out_compressor is not None:
+                compressed_file = NamedTemporaryFile(
+                    dir=self.config.wals_directory,
+                    prefix='.%s.' % wal_name,
+                    suffix='.compressed')
+                out_compressor.compress(source_file, compressed_file.name)
+                source_file = compressed_file.name
+
+        # Copy the prepared source file to destination
+        with open(source_file) as input_file:
+            shutil.copyfileobj(input_file, destination)
+
+        # Remove temp files
+        if uncompressed_file is not None:
+            uncompressed_file.close()
+        if compressed_file is not None:
+            compressed_file.close()
+
+    def cron(self, wals=True, retention_policies=True):
         """
         Maintenance operations
 
-        :param bool verbose: report even if no actions
         :param bool wals: WAL archive maintenance
         :param bool retention_policies: retention policy maintenance
         """
         try:
-            with ServerCronLock(self.config.barman_lock_directory, self.config.name):
-                # Standard maintenance (WAL archive)
+            # Actually this is the highest level of locking in the cron,
+            # this stops the execution of multiple cron on the same server
+            with ServerCronLock(self.config.barman_lock_directory,
+                                self.config.name):
+                # WAL management and maintenance
                 if wals:
-                    self.backup_manager.cron(verbose=verbose)
-                # Retention policy management
+                    # Execute the archive-wal sub-process
+                    self.cron_archive_wal()
+                    if self.config.streaming_archiver:
+                        # Spawn the receive-wal sub-process
+                        self.cron_receive_wal()
+                    else:
+                        # Terminate the receive-wal sub-process if present
+                        self.kill('receive-wal', fail_if_not_present=False)
+                # Retention policies execution
                 if retention_policies:
                     self.backup_manager.cron_retention_policy()
-        except LockFilePermissionDenied, e:
+        except LockFileBusy:
+            output.info(
+                "Another cron process is already running on server %s. "
+                "Skipping to the next server" % self.config.name)
+        except LockFilePermissionDenied as e:
             output.error("Permission denied, unable to access '%s'" % e)
-        except (OSError, IOError), e:
+        except (OSError, IOError) as e:
             output.error("%s", e)
+
+    def cron_archive_wal(self):
+        """
+        Method that handles the start of an 'archive-wal' sub-process.
+
+        This method must be run protected by ServerCronLock
+        """
+        try:
+            # Try to acquire ServerWalArchiveLock, if the lock is available,
+            # no other 'archive-wal' processes are running on this server.
+            #
+            # There is a very little race condition window here because
+            # even if we are protected by ServerCronLock, the user could run
+            # another 'archive-wal' command manually. However, it would result
+            # in one of the two commands failing on lock acquisition,
+            # with no other consequence.
+            with ServerWalArchiveLock(
+                    self.config.barman_lock_directory,
+                    self.config.name):
+                # Output and release the lock immediately
+                output.info("Starting WAL archiving for server %s",
+                            self.config.name, log=False)
+
+            # Init a Barman sub-process object
+            archive_process = BarmanSubProcess(
+                subcommand='archive-wal',
+                config=barman.__config__.config_file,
+                args=[self.config.name])
+            # Launch the sub-process
+            archive_process.execute()
+
+        except LockFileBusy:
+            # Another archive process is running for the server,
+            # warn the user and skip to the next sever.
+            output.info(
+                "Another archive-wal process is already running "
+                "on server %s. Skipping to the next server"
+                % self.config.name)
+
+    def cron_receive_wal(self):
+        """
+        Method that handles the start of a 'receive-wal' sub process
+
+        This method must be run protected by ServerCronLock
+        """
+        try:
+            # Try to acquire ServerWalReceiveLock, if the lock is available,
+            # no other 'receive-wal' processes are running on this server.
+            #
+            # There is a very little race condition window here because
+            # even if we are protected by ServerCronLock, the user could run
+            # another 'receive-wal' command manually. However, it would result
+            # in one of the two commands failing on lock acquisition,
+            # with no other consequence.
+            with ServerWalReceiveLock(
+                    self.config.barman_lock_directory,
+                    self.config.name):
+                # Output and release the lock immediately
+                output.info("Starting streaming archiver "
+                            "for server %s",
+                            self.config.name, log=False)
+
+            # Start a new receive-wal process
+            receive_process = BarmanSubProcess(
+                subcommand='receive-wal',
+                config=barman.__config__.config_file,
+                args=[self.config.name])
+            # Launch the sub-process
+            receive_process.execute()
+
+        except LockFileBusy:
+            # Another receive-wal process is running for the server
+            # exit without message
+            _logger.debug("Another STREAMING ARCHIVER process is running for "
+                          "server %s" % self.config.name)
+
+    def archive_wal(self, verbose=True):
+        """
+        Perform the WAL archiving operations.
+
+        Usually run as subprocess of the barman cron command,
+        but can be executed manually using the barman archive-wal command
+
+        :param bool verbose: if false outputs something only if there is
+            at least one file
+        """
+        output.debug("Starting archive-wal for server %s", self.config.name)
+        try:
+            # Take care of the archive lock.
+            # Only one archive job per server is admitted
+            with ServerWalArchiveLock(self.config.barman_lock_directory,
+                                      self.config.name):
+                self.backup_manager.archive_wal(verbose)
+        except LockFileBusy:
+            # If another process is running for this server,
+            # warn the user and skip to the next server
+            output.info("Another archive-wal process is already running "
+                        "on server %s. Skipping to the next server"
+                        % self.config.name)
+
+    def receive_wal(self, reset=False):
+        """
+        Enable the reception of WAL files using streaming protocol.
+
+        Usually started by barman cron command.
+        Executing this manually, the barman process will not terminate but
+        will continuously receive WAL files from the PostgreSQL server.
+
+        :param reset: When set, resets the status of receive-wal
+        """
+        # Execute the receive-wal command only if streaming_archiver
+        # is enabled
+        if not self.config.streaming_archiver:
+            output.error("Unable to start receive-wal process: "
+                         "streaming_archiver option set to 'off' in "
+                         "barman configuration file")
+            return
+
+        output.info("Starting receive-wal for server %s", self.config.name)
+        try:
+            # Take care of the receive-wal lock.
+            # Only one receiving process per server is permitted
+            with ServerWalReceiveLock(self.config.barman_lock_directory,
+                                      self.config.name):
+                try:
+                    # Only the StreamingWalArchiver implementation
+                    # does something.
+                    # WARNING: This codes assumes that there is only one
+                    # StreamingWalArchiver in the archivers list.
+                    for archiver in self.archivers:
+                        archiver.receive_wal(reset)
+                except ArchiverFailure as e:
+                    output.error("Impossible to start a receive-wal process "
+                                 "for server %s: %s" % (self.config.name, e))
+        except LockFileBusy:
+            # If another process is running for this server,
+            if reset:
+                output.info("Unable to reset the status of receive-wal "
+                            "for server %s. Process is still running"
+                            % self.config.name)
+            else:
+                output.info("Another receive-wal process is already running "
+                            "for server %s." % self.config.name)
 
     @contextmanager
     def xlogdb(self, mode='r'):
@@ -980,7 +1310,8 @@ class Server(object):
         Context manager to access the xlogdb file.
 
         This method uses locking to make sure only one process is accessing
-        the database at a time. The database file will be created if not exists.
+        the database at a time. The database file will be created
+        if it not exists.
 
         Usage example:
 
@@ -994,7 +1325,8 @@ class Server(object):
             os.makedirs(self.config.wals_directory)
         xlogdb = os.path.join(self.config.wals_directory, self.XLOG_DB)
 
-        with ServerXLOGDBLock(self.config.barman_lock_directory, self.config.name):
+        with ServerXLOGDBLock(self.config.barman_lock_directory,
+                              self.config.name):
             # If the file doesn't exist and it is required to read it,
             # we open it in a+ mode, to be sure it will be created
             if not os.path.exists(xlogdb) and mode.startswith('r'):
@@ -1079,5 +1411,53 @@ class Server(object):
 
         :param backup_info: the target backup
         """
-        backup_ext_info = self.get_backup_ext_info(backup_info)
-        output.result('show_backup', backup_ext_info)
+        try:
+            backup_ext_info = self.get_backup_ext_info(backup_info)
+            output.result('show_backup', backup_ext_info)
+        except xlog.BadXlogSegmentName as e:
+            output.error(
+                "invalid xlog segment name %r\n"
+                "HINT: Please run \"barman rebuild-xlogdb %s\" "
+                "to solve this issue" %
+                str(e), self.config.name)
+            output.close_and_exit()
+
+    @staticmethod
+    def _build_path(path_prefix=None):
+        """
+        If a path_prefix is provided build a string suitable to be used in
+        PATH environment variable by joining the path_prefix with the
+        current content of PATH environment variable.
+
+        If the `path_prefix` is None returns None.
+
+        :rtype: str|None
+        """
+        if not path_prefix:
+            return None
+        sys_path = os.environ.get('PATH')
+        return "%s%s%s" % (path_prefix, os.pathsep, sys_path)
+
+    def kill(self, task, fail_if_not_present=True):
+        """
+        Given the name of a barman sub-task type,
+        attempts to stop all the processes
+
+        :param string task: The task we want to stop
+        :param bool fail_if_not_present: Display an error when the process
+            is not present (default: True)
+        """
+        process_list = self.process_manager.list(task)
+        for process in process_list:
+            if self.process_manager.kill(process):
+                output.info('Stopped process %s(%s)',
+                            process.task, process.pid)
+                return
+            else:
+                output.error('Cannot terminate process %s(%s)',
+                             process.task, process.pid)
+                return
+        if fail_if_not_present:
+            output.error('Termination of %s failed: '
+                         'no such process for server %s',
+                         task, self.config.name)

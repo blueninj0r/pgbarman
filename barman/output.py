@@ -1,4 +1,4 @@
-# Copyright (C) 2013-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2013-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -19,12 +19,14 @@
 This module control how the output of Barman will be rendered
 """
 
+from __future__ import print_function
+
 import inspect
 import logging
 import sys
+
 from barman.infofile import BackupInfo
 from barman.utils import pretty_size
-
 
 __all__ = [
     'error_occurred', 'debug', 'info', 'warning', 'error', 'exception',
@@ -112,7 +114,8 @@ def _dispatch(obj, prefix, name, *args, **kwargs):
     :param obj: the target object
     :param str prefix: prefix of the method to be called
     :param str name: name of the method to be called
-    :param tuple args: all remaining positional arguments will be sent to target
+    :param tuple args: all remaining positional arguments will be sent
+        to target
     :param dict kwargs: all remaining keyword arguments will be sent to target
     :return: the result of the invoked method
     :raise ValueError: if the target method is not present
@@ -174,7 +177,8 @@ def warning(message, *args, **kwargs):
 def error(message, *args, **kwargs):
     """
     Output a message with severity 'ERROR'.
-    Also records that an error has occurred unless the ignore parameter is True.
+    Also records that an error has occurred unless the ignore parameter
+    is True.
 
     :key bool ignore: avoid setting an error exit status (default False)
     :key bool log: whether to log the message
@@ -202,14 +206,14 @@ def exception(message, *args, **kwargs):
     """
     # ignore and raise_exception are keyword-only parameters
     ignore = kwargs.pop('ignore', False)
-    #noinspection PyNoneFunctionAssignment
+    # noinspection PyNoneFunctionAssignment
     raise_exception = kwargs.pop('raise_exception', None)
     if not ignore:
         kwargs.setdefault('is_error', True)
     _put('exception', message, *args, **kwargs)
     if raise_exception:
         if callable(raise_exception):
-            #noinspection PyCallingNonCallable
+            # noinspection PyCallingNonCallable
             raise raise_exception(message)
         elif isinstance(raise_exception, BaseException):
             raise raise_exception
@@ -324,13 +328,13 @@ class ConsoleOutputWriter(object):
         """
         Print a message on standard output
         """
-        print >> sys.stdout, _format_message(message, args)
+        print(_format_message(message, args), file=sys.stdout)
 
     def _err(self, message, args):
         """
         Print a message on standard error
         """
-        print >> sys.stderr, _format_message(message, args)
+        print(_format_message(message, args), file=sys.stderr)
 
     def is_quiet(self):
         """
@@ -440,6 +444,15 @@ class ConsoleOutputWriter(object):
                       "\"barman_xlog\" directory")
             self.info("inside the PostgreSQL data directory.")
 
+        if results['get_wal']:
+            self.info("")
+            self.info("WARNING: 'get-wal' is in the specified "
+                      "'recovery_options'.")
+            self.info("Before you start up the PostgreSQL server, please "
+                      "review the recovery.conf file")
+            self.info("inside the target directory. Make sure that "
+                      "'restore_command' can be executed by "
+                      "the PostgreSQL user.")
         self.info("")
         self.info("Your PostgreSQL server has been successfully "
                   "prepared for recovery!")
@@ -525,7 +538,8 @@ class ConsoleOutputWriter(object):
                              pretty_size(backup_size),
                              pretty_size(wal_size)))
             if backup_info.tablespaces:
-                tablespaces = [("%s:%s" % (tablespace.name, tablespace.location))
+                tablespaces = [("%s:%s" % (tablespace.name,
+                                           tablespace.location))
                                for tablespace in backup_info.tablespaces]
                 out_list.append(' (tablespaces: %s)' %
                                 ', '.join(tablespaces))
@@ -539,9 +553,11 @@ class ConsoleOutputWriter(object):
         """
         Output all available information about a backup in show-backup command
 
-        The argument has to be the result of a Server.get_backup_ext_info() call
+        The argument has to be the result
+        of a Server.get_backup_ext_info() call
 
-        :param dict backup_ext_info: a dictionary containing the info to display
+        :param dict backup_ext_info: a dictionary containing
+            the info to display
         """
         data = dict(backup_ext_info)
         self.info("Backup %s:", data['backup_id'])
@@ -600,21 +616,22 @@ class ConsoleOutputWriter(object):
                           data['wals_per_second'] * 3600)
             # Output WAL compression ratio for archived WAL files
             if data['wal_until_next_compression_ratio'] > 0:
-                self.info("    Compression ratio    : %s",
-                          '{percent:.2%}'.format(
-                              percent=data['wal_until_next_compression_ratio']))
+                self.info(
+                    "    Compression ratio    : %s",
+                    '{percent:.2%}'.format(
+                        percent=data['wal_until_next_compression_ratio']))
             self.info("    Last available       : %s", data['wal_last'])
             self.info("")
             self.info("  Catalog information:")
             self.info("    Retention Policy     : %s",
-                      data['retention_policy_status']
-                      or 'not enforced')
+                      data['retention_policy_status'] or
+                      'not enforced')
             self.info("    Previous Backup      : %s",
-                      data.setdefault('previous_backup_id', 'not available')
-                      or '- (this is the oldest base backup)')
+                      data.setdefault('previous_backup_id', 'not available') or
+                      '- (this is the oldest base backup)')
             self.info("    Next Backup          : %s",
-                      data.setdefault('next_backup_id', 'not available')
-                      or '- (this is the latest base backup)')
+                      data.setdefault('next_backup_id', 'not available') or
+                      '- (this is the latest base backup)')
         else:
             if data['error']:
                 self.info("  Error:            : %s",
@@ -725,7 +742,7 @@ class NagiosOutputWriter(ConsoleOutputWriter):
 
         # Global error (detected at configuration level)
         if len(issues) == 0 and error_occurred:
-            print "BARMAN CRITICAL - Global configuration errors"
+            print("BARMAN CRITICAL - Global configuration errors")
             error_exit_code = 2
             return
 
@@ -755,37 +772,39 @@ class NagiosOutputWriter(ConsoleOutputWriter):
                 # .....
                 for issue in self.result_check_list:
                     if issue['server_name'] == server and not issue['status']:
-                        fail_detail = "%s.%s: FAILED" % (server, issue['check'])
+                        fail_detail = "%s.%s: FAILED" % (server,
+                                                         issue['check'])
                         if issue['hint']:
                             fail_detail += " (%s)" % issue['hint']
                         details.append(fail_detail)
             # Append the summary of failures to the first line of the output
             # using * as delimiter
             if len(servers) == 1:
-                print "BARMAN CRITICAL - server %s has issues * %s" % \
-                    (servers[0], " * ".join(fail_summary))
+                print("BARMAN CRITICAL - server %s has issues * %s" %
+                      (servers[0], " * ".join(fail_summary)))
             else:
-                print "BARMAN CRITICAL - %d server out of %d have issues * " \
+                print("BARMAN CRITICAL - %d server out of %d have issues * "
                       "%s" % (len(issues), len(servers),
-                              " * ".join(fail_summary))
+                              " * ".join(fail_summary)))
 
             # add the detailed list to the output
             for issue in details:
-                print issue
+                print(issue)
             error_exit_code = 2
         else:
             # No issues, all good!
             # Display the output message for a single server check
             if len(servers) == 1:
-                print "BARMAN OK - Ready to serve the Espresso backup " \
-                    "for %s" % \
-                    (servers[0])
+                print("BARMAN OK - Ready to serve the Espresso backup "
+                      "for %s" %
+                      (servers[0]))
             else:
                 # Display the output message for several servers, using
                 # '*' as delimiter
-                print "BARMAN OK - Ready to serve the Espresso backup " \
-                    "for %d server(s) * %s" % \
-                    (len(servers), " * ".join([server for server in servers]))
+                print("BARMAN OK - Ready to serve the Espresso backup "
+                      "for %d server(s) * %s" % (
+                          len(servers),
+                          " * ".join([server for server in servers])))
 
 
 #: This dictionary acts as a registry of available OutputWriters

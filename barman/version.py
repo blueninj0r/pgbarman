@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2015 2ndQuadrant Italia (Devise.IT S.r.L.)
+# Copyright (C) 2011-2016 2ndQuadrant Italia Srl
 #
 # This file is part of Barman.
 #
@@ -15,7 +15,8 @@
 # You should have received a copy of the GNU General Public License
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
-''' This module contains the current Barman version.
+'''
+This module contains the current Barman version.
 '''
 
-__version__ = '1.4.1a1-nochecksum'
+__version__ = '1.6.1a1-nochecksum'
